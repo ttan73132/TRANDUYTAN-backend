@@ -1,4 +1,10 @@
-# Backend chấm công — Nguyễn Hoài Nam, 2380601398, nhóm 8
+# TRANDUYTAN Backend — Nhóm 8
+
+Backend bài nộp: https://github.com/ttan73132/TRANDUYTAN-backend. Frontend Flutter: https://github.com/ttan73132/TRANDUYTAN-frontend.
+
+Fork từ backend nhóm do Nguyễn Hoài Nam phát triển: https://github.com/wom-sama/nguyen-hoai-nam-2380601398-api. Giữ lịch sử và tác giả nguồn gốc. API app hiện dùng vẫn là `https://nguyen-hoai-nam-2380601398-api.onrender.com/v1`; tạo repository không tự triển khai dịch vụ mới. Source Node.js, migration, test và cấu hình Render nằm ngay tại root repository này.
+
+## Tài liệu backend gốc — Nguyễn Hoài Nam, 2380601398, nhóm 8
 
 API Node.js/PostgreSQL dành cho app Flutter. Chỉ triển khai trên dịch vụ có HTTPS để nộp bài; app không được cấu hình API localhost. README mô tả source, cấu hình và bằng chứng kiểm chứng; trạng thái API/email production cần đối chiếu với kết quả triển khai thực tế.
 
