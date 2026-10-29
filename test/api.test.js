@@ -84,6 +84,50 @@ async function advanceTo(time, ...users) {
 }
 const fid = n => `c${String(n).padStart(21, '0')}`;
 const factAnswersOf = row => row.criticalFacts.map(fact=>({factId:fact.id,value:fact.value}));
+const cameraResult = (extra={}) => ({clientRequestId:randomUUID(),sourceLanguage:'vi',targetLanguage:'en',originalText:'Bàn giao thiết bị EQ-12 lúc 22:00.',translatedText:'Hand over equipment EQ-12 at 22:00.',...extra});
+
+test('camera results require an authenticated active account',async()=>{
+  assert.equal((await api().get('/v1/camera-translations')).status,401);
+  const pending=await account({status:'pending'});
+  assert.equal((await api().post('/v1/camera-translations').set(auth(pending.accessToken)).send(cameraResult())).status,403);
+});
+test('camera saves text only and retrieves the owner result with its selected languages',async()=>{
+  const owner=await account(); const input=cameraResult({sourceLanguage:'zh',targetLanguage:'vi',originalText:'设备 EQ-12',translatedText:'Thiết bị EQ-12'});
+  const saved=await api().post('/v1/camera-translations').set(auth(owner.accessToken)).send(input);
+  assert.equal(saved.status,201);assert.ok(saved.body.data.id);assert.ok(saved.body.data.createdAt);
+  for(const key of ['originalText','translatedText','sourceLanguage','targetLanguage'])assert.equal(saved.body.data[key],input[key]);
+  assert.equal(saved.body.data.userId,undefined);assert.equal(saved.body.data.imageBase64,undefined);
+  const list=await api().get('/v1/camera-translations').set(auth(owner.accessToken));
+  assert.equal(list.status,200);assert.deepEqual(list.body.data,[saved.body.data]);
+});
+test('camera save retry is idempotent and request reuse cannot change a saved result',async()=>{
+  const owner=await account();const input=cameraResult();
+  const first=await api().post('/v1/camera-translations').set(auth(owner.accessToken)).send(input);
+  assert.equal(first.status,201);
+  const retry=await api().post('/v1/camera-translations').set(auth(owner.accessToken)).send(input);
+  assert.equal(retry.status,200);assert.deepEqual(retry.body.data,first.body.data);
+  const conflict=await api().post('/v1/camera-translations').set(auth(owner.accessToken)).send({...input,translatedText:'Changed text'});
+  assert.equal(conflict.status,409);assert.equal(conflict.body.error.code,'CAMERA_REQUEST_CONFLICT');
+  const list=await api().get('/v1/camera-translations').set(auth(owner.accessToken));
+  assert.deepEqual(list.body.data,[first.body.data]);
+});
+test('camera history is private even from other admins and owner deletion is scoped',async()=>{
+  const owner=await account();const outsider=await account({role:'admin'});
+  const saved=await api().post('/v1/camera-translations').set(auth(owner.accessToken)).send(cameraResult());
+  assert.equal(saved.status,201);
+  assert.deepEqual((await api().get('/v1/camera-translations').set(auth(outsider.accessToken))).body.data,[]);
+  assert.equal((await api().delete('/v1/camera-translations/'+saved.body.data.id).set(auth(outsider.accessToken))).status,404);
+  assert.equal((await api().delete('/v1/camera-translations/'+saved.body.data.id).set(auth(owner.accessToken))).status,200);
+  assert.deepEqual((await api().get('/v1/camera-translations').set(auth(owner.accessToken))).body.data,[]);
+});
+test('camera rejects images, unsupported pairs, empty or oversized text and malformed request IDs',async()=>{
+  const owner=await account();
+  for(const extra of [{imageBase64:'not-accepted'},{sourceLanguage:'fr'},{targetLanguage:'vi'},{originalText:' '},{translatedText:'x'.repeat(6001)},{clientRequestId:'invalid'}]){
+    const r=await api().post('/v1/camera-translations').set(auth(owner.accessToken)).send(cameraResult(extra));
+    assert.equal(r.status,422);assert.equal(r.body.error.code,'VALIDATION_ERROR');
+  }
+  assert.deepEqual((await api().get('/v1/camera-translations').set(auth(owner.accessToken))).body.data,[]);
+});
 async function criticalHandover({ employee, recipient, duty, extra={} }) {
   const result = await api().post('/v1/handovers').set(auth(employee.accessToken)).send({shiftId:duty.id,recipientId:recipient.id,
     originalText:'Thiết bị EQ-12; số lượng 12.5; hạn 2026-10-29 17:30.',translatedText:'Equipment EQ-12; quantity 12.5; deadline 2026-10-29 17:30.',

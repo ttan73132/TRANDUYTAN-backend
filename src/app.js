@@ -3,6 +3,7 @@ import { ApiError, publicUser, rateLimit } from './security.js';
 import { createAuth } from './auth.js';
 import { createResources } from './resources.js';
 import { createNotifications } from './notifications.js';
+import { createCameraTranslations } from './camera-translations.js';
 
 export function createApp({ pool, config, mailer, now = () => new Date(), pushProvider, autoStartNotifications = false }) {
   const app = express();
@@ -27,7 +28,7 @@ export function createApp({ pool, config, mailer, now = () => new Date(), pushPr
   const auth = createAuth({ pool, config, mailer, now });
   app.use('/v1/auth', auth.router);
   app.get('/v1/me', auth.requireAuth, (req, res) => res.json({ data: publicUser(req.user) }));
-  app.use('/v1', auth.requireAuth, auth.requireActive, notifications.router,
+  app.use('/v1', auth.requireAuth, auth.requireActive, notifications.router, createCameraTranslations({pool,now}),
     createResources({ pool, now, timeZone: config.timeZone, enqueueNotification: notifications.enqueue }));
   app.use((_req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Không tìm thấy API.' } }));
   app.use((error, _req, res, _next) => {

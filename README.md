@@ -2,6 +2,8 @@
 
 API Node.js/PostgreSQL dành cho app Flutter. Chỉ triển khai trên dịch vụ có HTTPS để nộp bài; app không được cấu hình API localhost. README mô tả source, cấu hình và bằng chứng kiểm chứng; trạng thái API/email production cần đối chiếu với kết quả triển khai thực tế.
 
+Bổ sung dịch camera trực tiếp: OCR/dịch trên điện thoại; người dùng chủ động lưu văn bản qua API và đọc lại lịch sử riêng. Hợp đồng3route, idempotency và phạm vi quyền ở [LIVE_CAMERA_TRANSLATION.md](docs/LIVE_CAMERA_TRANSLATION.md). Backend sau bổ sung đạt **96/96** kiểm thử;12checks PostgreSQL camera được kiểm riêng với schema tạm đã dọn.
+
 ## Chạy và deploy
 
 Yêu cầu Node.js 22 trở lên; đã kiểm tra các lệnh Node và kiểm thử trên Node.js 24.14.0/Windows. Không dùng Python. Từ thư mục `backend`:
