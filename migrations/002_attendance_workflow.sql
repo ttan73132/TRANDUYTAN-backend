@@ -1,0 +1,13 @@
+ALTER TABLE branches ADD COLUMN time_policy jsonb NOT NULL DEFAULT '{"checkInEarlyMinutes":30,"lateGraceMinutes":10,"earlyLeaveGraceMinutes":10,"checkOutLateMinutes":120}';
+ALTER TABLE shifts ADD COLUMN time_policy_snapshot jsonb;
+UPDATE shifts SET time_policy_snapshot=branches.time_policy FROM branches WHERE shifts.branch_id=branches.id;
+ALTER TABLE shifts ALTER COLUMN time_policy_snapshot SET NOT NULL;
+ALTER TABLE attendance ADD COLUMN recorded_check_in_at timestamptz;
+ALTER TABLE attendance ADD COLUMN recorded_check_out_at timestamptz;
+UPDATE attendance SET recorded_check_in_at=check_in_at,recorded_check_out_at=check_out_at WHERE source='device';
+ALTER TABLE attendance ADD CONSTRAINT attendance_recorded_order CHECK (recorded_check_out_at IS NULL OR recorded_check_in_at IS NULL OR recorded_check_out_at>=recorded_check_in_at);
+UPDATE shifts SET status='scheduled';
+UPDATE shifts SET status=CASE WHEN attendance.check_out_at IS NULL THEN 'in_progress' ELSE 'completed' END FROM attendance WHERE attendance.shift_id=shifts.id;
+ALTER TABLE corrections ADD COLUMN before_attendance jsonb;
+ALTER TABLE corrections ADD COLUMN after_attendance jsonb;
+ALTER TABLE corrections ADD COLUMN resolved_at timestamptz;
