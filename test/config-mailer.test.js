@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { databaseOptions, loadConfig } from '../src/config.js';
 import { createBrevoMailer } from '../src/mailer.js';
 
-const env = { JWT_SECRET: 'test-only-jwt-'.repeat(4), OTP_SECRET: 'test-only-otp-'.repeat(4), BREVO_API_KEY: 'test-only-key', BREVO_SENDER_EMAIL: 'sender@example.test' };
+const env = { EMAIL_PROVIDER: 'brevo', JWT_SECRET: 'test-only-jwt-'.repeat(4), OTP_SECRET: 'test-only-otp-'.repeat(4), BREVO_API_KEY: 'test-only-key', BREVO_SENDER_EMAIL: 'sender@example.test' };
 test('configuration rejects missing or reused authentication secrets', () => {
   assert.throws(() => loadConfig({ ...env, OTP_SECRET: env.JWT_SECRET }));
   assert.throws(() => loadConfig({ ...env, JWT_SECRET: '' }));

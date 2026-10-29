@@ -1,0 +1,8 @@
+{
+  "timeZone": "Asia/Bangkok",
+  "dependencies": {},
+  "runtimeVersion": "V8",
+  "exceptionLogging": "STACKDRIVER",
+  "oauthScopes": ["https://www.googleapis.com/auth/script.send_mail"],
+  "webapp": { "access": "ANYONE_ANONYMOUS", "executeAs": "USER_DEPLOYING" }
+}

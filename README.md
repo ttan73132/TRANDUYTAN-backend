@@ -1,6 +1,6 @@
 # Backend chấm công — Nguyễn Hoài Nam, 2380601398, nhóm 8
 
-API Node.js/PostgreSQL dành cho app Flutter. Chỉ triển khai trên dịch vụ có HTTPS để nộp bài; app không được cấu hình API localhost. Hiện source có thể deploy nhưng chưa có URL production hoặc tài khoản email được cấu hình sẵn.
+API Node.js/PostgreSQL dành cho app Flutter. Chỉ triển khai trên dịch vụ có HTTPS để nộp bài; app không được cấu hình API localhost. README mô tả source, cấu hình và bằng chứng kiểm chứng; trạng thái API/email production cần đối chiếu với kết quả triển khai thực tế.
 
 ## Chạy và deploy
 
@@ -21,8 +21,11 @@ node tool/setup-env.js
 | `DATABASE_CA_CERT` | PEM CA riêng nếu nhà cung cấp yêu cầu; không tắt kiểm tra chứng chỉ |
 | `APP_TIME_ZONE` | Ngày công của dashboard; mặc định `Asia/Bangkok` theo múi giờ phiên làm việc (UTC+7) |
 | `JWT_SECRET`, `OTP_SECRET` | Hai khóa khác nhau, tối thiểu 32 ký tự; chỉ ở backend |
-| `BREVO_API_KEY` | Khóa API Brevo có quyền gửi transactional email |
-| `BREVO_SENDER_EMAIL` | Địa chỉ người gửi đã được cấu hình/xác minh trong Brevo |
+| `EMAIL_PROVIDER` | `apps_script` mặc định; `brevo` là phương án tùy chọn |
+| `OTP_RELAY_URL` | URL Web App đúng dạng `https://script.google.com/macros/s/<deployment>/exec` |
+| `OTP_RELAY_SECRET` | Khóa riêng tối thiểu 32 ký tự, khác hai khóa trên; cùng giá trị với Script property của relay |
+| `BREVO_API_KEY` | Chỉ cần nếu chọn `EMAIL_PROVIDER=brevo` |
+| `BREVO_SENDER_EMAIL` | Chỉ cần với Brevo: địa chỉ người gửi đã cấu hình/xác minh |
 | `BOOTSTRAP_ADMIN_FULL_NAME` | Tên quản trị viên đầu tiên |
 | `BOOTSTRAP_ADMIN_USERNAME` | Tên đăng nhập quản trị viên |
 | `BOOTSTRAP_ADMIN_EMAIL` | Email thật để nhận OTP |
@@ -34,21 +37,37 @@ Nếu đã đặt các biến `BOOTSTRAP_ADMIN_*`, lần khởi động đầu t
 
 ### Render Free
 
-`render.yaml` là cấu hình để xem xét, tự nó không tạo hoặc publish dịch vụ. Nếu repository chứa toàn bộ project Flutter, chọn Root Directory là `backend` trong Render. Build command:
+`render.yaml` là cấu hình để xem xét, tự nó không tạo hoặc publish dịch vụ. Repository triển khai hiện là **backend-only ở repository root**: khi tạo Web Service thủ công, để trống Root Directory, không nhập `backend`. Dùng lại database đã tạo `nguyen-hoai-nam-2380601398-db`; không tạo database thứ hai từ blueprint. Build command:
 
 ```sh
 ONNXRUNTIME_NODE_INSTALL=skip npm ci && npm run models:fetch
 ```
 
-Start command: `npm start`. Health check: `/v1/health`. Đặt `NODE_ENV=production`, `TRUST_PROXY=true` và các biến bảng trên qua giao diện quản lý bí mật của Render. `ONNXRUNTIME_NODE_INSTALL=skip` bỏ tải GPU CUDA tùy chọn; backend dùng binary CPU chính thức đã có trong package. Dịch vụ cần được thử thực tế trên Linux/Render trước khi xác nhận deploy thành công.
+Start command: `npm start`. Health check: `/v1/health`. Đặt `NODE_ENV=production`, `TRUST_PROXY=true` và các biến bảng trên qua giao diện quản lý bí mật của Render. Điền **External Database URL đầy đủ** vào `DATABASE_URL`, giữ `DATABASE_SSL=true` để xác minh chứng chỉ CA/hostname. [Internal URL của Render](https://render.com/docs/postgresql-creating-connecting#ssl-modes-for-internal-connections) dùng chứng chỉ tự ký và không hỗ trợ verify-ca/full; không tắt xác minh TLS để vượt qua lỗi này. Không đưa URL chứa mật khẩu vào source. `ONNXRUNTIME_NODE_INSTALL=skip` bỏ tải GPU CUDA tùy chọn; backend dùng binary CPU chính thức đã có trong package. Dịch vụ API còn cần thử trên Linux/Render trước khi xác nhận deploy thành công.
 
-[Render Free](https://render.com/docs/free) có cold start sau thời gian không truy cập; filesystem không phải nơi lưu dữ liệu lâu dài; Postgres Free hết hạn sau 30 ngày. Dữ liệu nghiệp vụ được lưu PostgreSQL, không lưu trong file của web service. SMTP outbound của Free bị hạn chế nên email dùng HTTPS API. Chưa đo hiệu năng/giới hạn RAM của nhận diện mặt trên hosting này.
+[Render Free](https://render.com/docs/free) có cold start sau thời gian không truy cập; filesystem không phải nơi lưu dữ liệu lâu dài; database Free hiện tại hết hạn ngày **28/11/2026**. Dữ liệu nghiệp vụ được lưu PostgreSQL, không lưu trong file của web service. SMTP outbound của Free bị hạn chế nên email dùng relay HTTPS. Chưa đo hiệu năng/giới hạn RAM của nhận diện mặt trên hosting này.
 
 ### Email OTP thật
 
-Adapter gửi `POST https://api.brevo.com/v3/smtp/email`, theo [tài liệu Brevo](https://developers.brevo.com/docs/send-a-transactional-email). API không có chế độ hiện OTP trên màn hình hoặc ghi OTP vào log. Khi nhà cung cấp không gửi được, trả `503 EMAIL_UNAVAILABLE` và vô hiệu hóa challenge đó; người dùng đăng nhập/yêu cầu mã mới sau thời gian chờ.
+Mặc định dùng Google Apps Script với Gmail hiện có, không cần mua domain. Source relay tại [Code.gs](tool/apps-script/Code.gs), manifest tại [appsscript.json](tool/apps-script/appsscript.json). Manifest chỉ yêu cầu `https://www.googleapis.com/auth/script.send_mail`; không xin quyền đọc Gmail. Source không chứa địa chỉ tài khoản hoặc khóa thật.
 
-[Brevo Free](https://help.brevo.com/hc/en-us/articles/208589409-About-Brevo-s-pricing-plans) hiện có hạn mức 300 email/ngày. Tài khoản và người gửi phải được chuẩn bị/xác minh. Địa chỉ Gmail/free domain không thể tự xác thực domain; Brevo có thể thay domain người gửi bằng `@brevosend.com` để hỗ trợ tạm thời. Xem [hướng dẫn domain](https://help.brevo.com/hc/en-us/articles/16045394674066-Troubleshooting-Domain-authentication). Cần gửi thử đến email của các thành viên thật; không mặc định thư chắc chắn được giao hoặc mọi tài khoản đều được duyệt gửi ngay.
+Các bước cấu hình cụ thể do chủ tài khoản thực hiện:
+
+1. Chạy `node tool/apps-script/create-secret.js` cục bộ. Script chỉ tạo `.env.relay` bằng khóa ngẫu nhiên 48 byte, không ghi đè tệp đã có và không in khóa. Tệp này bị `.gitignore` loại bỏ. Mở cục bộ để lấy giá trị, không dán vào chat/Git.
+2. Trong [Google Apps Script](https://script.google.com/), tạo project với Gmail muốn dùng gửi OTP. Thay nội dung `Code.gs` bằng source relay đã xem xét.
+3. Vào **Project Settings**, bật hiển thị manifest `appsscript.json`; thay manifest bằng tệp kèm theo. Trong **Script properties**, thêm `OTP_RELAY_SECRET` với đúng khóa vừa tạo. Không đặt khóa trong Code.gs.
+4. Chọn hàm **authorizeRelayOwner** rồi **Run**. Hàm chỉ đọc hạn mức MailApp để yêu cầu scope gửi email, không gửi thư thử và không đọc hộp thư. Chủ tài khoản tự xem xét và hoàn tất cấp quyền Google. Nếu Google hiện cảnh báo ứng dụng chưa xác minh hoặc màn hình xác thực, dừng tự động hóa và để chủ tài khoản xử lý trực tiếp; không tắt hoặc tự động vượt qua bảo vệ.
+5. Chọn **Deploy → New deployment → Web app**. **Execute as: Me**; **Who has access: Anyone** (không yêu cầu người gọi đăng nhập Google). Chốt deploy sau khi chủ tài khoản đã xem source/quyền, rồi lấy URL `/exec`; không dùng URL `/dev`. Endpoint mở cho request nhưng chỉ payload có HMAC hợp lệ mới gửi được thư.
+6. Trong bí mật môi trường backend/Render, đặt `EMAIL_PROVIDER=apps_script`, `OTP_RELAY_URL` là URL trên và `OTP_RELAY_SECRET` cùng giá trị Script property. URL không được có query, fragment, port hoặc credentials. Nếu chạy cục bộ bằng `.env`, sao chép khóa vào biến tương ứng trong `.env`; script không tự đọc `.env.relay` khi server chạy.
+7. Deploy backend, thử đăng nhập/đăng ký với email thật của nhóm và xác nhận thư đến hộp thư. Khi sửa relay, vào **Deploy → Manage deployments → Edit → New version** rồi deploy lại; giữ deployment URL nếu dùng cùng deployment. Việc qua test VM chưa chứng minh Google đã cấp quyền hoặc thư đã được giao.
+
+Backend POST JSON `{payload,signature}`: `payload` là chuỗi JSON chứa đúng `to,code,purpose,issuedAt,nonce,ttlMinutes`, được ký HMAC-SHA256 bằng khóa relay riêng. Relay kiểm chữ ký theo vòng so sánh cố định, thời gian lệch tối đa ±120 giây, người nhận đơn, OTP sáu số, purpose hợp lệ và TTL 1–10 phút. Sau xác minh, ScriptLock bảo vệ nonce/throttle/quota và gửi thư; nonce được lưu bền trước khi kiểm quota/gửi nên cả lần gửi lỗi cũng không được phát lại. Cache nonce tối đa 256 mục, hết hạn sau 5 phút; tối đa 20 request hợp lệ/phút. Payload/OTP/email không lưu trong Script properties hoặc log; phản hồi chỉ `{ok:true}` sau khi MailApp trả về thành công, còn lại `{ok:false}`. GET không gửi thư. Request chưa qua validation hoặc không lấy được lock không gửi và không được nhận vào hàng đợi.
+
+[ContentService](https://developers.google.com/apps-script/guides/content#redirects) trả kết quả qua URL dùng một lần tại `script.googleusercontent.com`. Adapter chỉ theo redirect 302/303 tới host này bằng GET, không gửi lại payload hoặc khóa. Vì relay không đặt HTTP status tùy ý, backend kiểm JSON `ok === true` nghiêm ngặt, giới hạn response 4KiB và timeout 15 giây. Sai chữ ký, hết quota, lỗi gửi hoặc response khác đều thành `503 EMAIL_UNAVAILABLE` và challenge bị vô hiệu hóa; không có chế độ hiện OTP trên màn hình/log.
+
+[Quota Apps Script](https://developers.google.com/apps-script/guides/services/quotas) hiện nêu 100 người nhận/ngày cho tài khoản tiêu dùng như Gmail và có thể thay đổi. Relay kiểm `MailApp.getRemainingDailyQuota()` trước mỗi thư; không hứa gửi không giới hạn, không hứa thư đến tức thì. Gửi thư dùng [MailApp](https://developers.google.com/apps-script/reference/mail/mail-app), không dùng Gmail API/read scope.
+
+Brevo vẫn là phương án tùy chọn: đặt `EMAIL_PROVIDER=brevo`, điền `BREVO_API_KEY/BREVO_SENDER_EMAIL` đã xác minh; adapter dùng [Brevo HTTPS API](https://developers.brevo.com/docs/send-a-transactional-email). Những biến Brevo không bắt buộc khi chọn Apps Script, và không tự chuyển provider khi cấu hình lỗi.
 
 ## Hợp đồng API
 
@@ -120,8 +139,10 @@ npm test
 npm audit --omit=dev --audit-level=high
 ```
 
-API tests chạy Express thật, SQL/schema thật qua `pg-mem`, thay riêng việc gửi email bằng mailbox trong test; OTP không bị giả lập ở handler. Các test mặt chạy model ONNX thật với fixture chính thức OpenCV, không thêm nhân viên hoặc template mẫu vào production. Không coi `pg-mem` là bằng chứng PostgreSQL production, row lock/rollback/concurrency hay network/TLS đã hoạt động: chưa có server PostgreSQL/Docker trên máy để thử các phần đó. Migration/bootstrap cần được chạy trên database deploy thật; email cần tài khoản gửi thật; camera/vị trí/micro cần tích hợp app/giả lập. Các dữ liệu này chưa được chứng minh chỉ bằng unit/integration tests cục bộ.
+API tests chạy Express thật, SQL/schema thật qua `pg-mem`, thay riêng việc gửi email bằng mailbox trong test; OTP không bị giả lập ở handler. Các test mặt chạy model ONNX thật với fixture chính thức OpenCV, không thêm nhân viên hoặc template mẫu vào production. Tests relay thực thi Code.gs thật trong Node VM với stub các dịch vụ Google để kiểm chứng HMAC/freshness/replay/quota/throttle; adapter dùng boundary fetch được kiểm soát. Những test này không gửi email thật hoặc cấp quyền Google.
 
-Lần kiểm chứng gần nhất: **51/51 tests đạt**, gồm metadata/quyền bàn giao, các biên cửa sổ chấm công, ca qua đêm, ân hạn đúng biên, snapshot chính sách, khóa kế hoạch, giữ dấu vết thiết bị khi duyệt điều chỉnh và phạm vi báo cáo tháng. Đây là kiểm chứng cục bộ theo phạm vi trên, không thay thế kiểm thử deployment.
+Đã kiểm chứng kết nối tới database **PostgreSQL 17.11 trên Render Singapore** qua External URL với `rejectUnauthorized:true`, chạy `SELECT version()` thành công và chạy `applyMigrations(pool)` hai lần thành công, gồm `001_initial.sql` và `002_attendance_workflow.sql`. Điều này xác nhận kết nối/chứng chỉ, DDL, việc gọi advisory lock và tính idempotent của migration trên DB thật. Không suy rộng thành bằng chứng cho tranh chấp row lock/rollback đồng thời hoặc toàn bộ CRUD production. API Linux/Render, bootstrap admin và gửi/nhận email Google end-to-end còn phải kiểm chứng trong triển khai thực tế; camera/vị trí/micro cần tích hợp app/giả lập.
 
-Không có commit, push, repository, tài khoản dịch vụ hoặc production deployment tự tạo bởi backend này.
+Lần kiểm chứng cục bộ gần nhất: **65/65 tests đạt**, gồm 51 regression nghiệp vụ/mặt và 14 kiểm thử cấu hình/adapter/giao thức relay mới. Có các kiểm thử biên cửa sổ chấm công, ca qua đêm, ân hạn, snapshot chính sách, khóa kế hoạch, giữ dấu vết khi điều chỉnh và phạm vi báo cáo tháng. Đây không thay thế kiểm thử deployment.
+
+Thông tin kết nối, tài khoản và khóa thật được quản lý ngoài repository, không được đóng gói cùng frontend hoặc APK.

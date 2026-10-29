@@ -1,10 +1,10 @@
-# Review in your own Render account before applying. No service is created by this file alone.
+# Backend-only repository root. Manual Web Service setup is preferred for the
+# existing database nguyen-hoai-nam-2380601398-db; this file creates no second DB.
 services:
   - type: web
-    name: nguyen-hoai-nam-attendance-api
+    name: nguyen-hoai-nam-2380601398-api
     runtime: node
     plan: free
-    rootDir: backend
     buildCommand: npm ci && npm run models:fetch
     startCommand: npm start
     healthCheckPath: /v1/health
@@ -22,20 +22,14 @@ services:
       - key: DATABASE_SSL
         value: "true"
       - key: DATABASE_URL
-        fromDatabase:
-          name: attendance-db
-          property: connectionString
+        sync: false
       - key: JWT_SECRET
         generateValue: true
       - key: OTP_SECRET
         generateValue: true
-      - key: BREVO_API_KEY
+      - key: EMAIL_PROVIDER
+        value: apps_script
+      - key: OTP_RELAY_URL
         sync: false
-      - key: BREVO_SENDER_EMAIL
+      - key: OTP_RELAY_SECRET
         sync: false
-      - key: BREVO_SENDER_NAME
-        value: Chấm công Nguyễn Hoài Nam
-databases:
-  - name: attendance-db
-    plan: free
-    databaseName: attendance
