@@ -14,7 +14,13 @@ beforeEach(async () => {
   const db = newDb();
   db.public.registerFunction({ name: 'length', args: ['text'], returns: 'integer', implementation: value => value.length });
   const migrations = new URL('../migrations/', import.meta.url);
-  for (const file of (await readdir(migrations)).filter(file => /^\d+_.*\.sql$/.test(file)).sort()) db.public.none(await readFile(new URL(file, migrations), 'utf8'));
+  for (const file of (await readdir(migrations)).filter(file => /^\d+_.*\.sql$/.test(file)).sort()) {
+    let sql = await readFile(new URL(file, migrations), 'utf8');
+    // pg-mem numbers unnamed CHECKs; PostgreSQL names this column CHECK below.
+    // Match its real name so migration 006 replaces the same constraint in both.
+    if (file === '001_initial.sql') sql = sql.replace('CHECK (radius_meters BETWEEN 20 AND 5000)', 'CONSTRAINT branches_radius_meters_check CHECK (radius_meters BETWEEN 20 AND 5000)');
+    db.public.none(sql);
+  }
   const adapter = db.adapters.createPg();
   pool = new adapter.Pool();
   mail = [];
@@ -83,6 +89,32 @@ async function advanceTo(time, ...users) {
   }
 }
 const fid = n => `c${String(n).padStart(21, '0')}`;
+test('branch radius accepts the inclusive 20m to 200km range and rejects values outside it', async () => {
+  const admin = await account({ role: 'admin' });
+  const body = { name: 'Test wide branch', address: 'Synthetic test area', latitude: 10, longitude: 106, radiusMeters: 200000 };
+  const created = await api().post('/v1/branches').set(auth(admin.accessToken)).send(body);
+  assert.equal(created.status, 201); const branchId = created.body.data.id;
+  assert.equal(created.body.data.radiusMeters, 200000);
+  assert.equal((await api().patch(`/v1/branches/${branchId}`).set(auth(admin.accessToken)).send({ radiusMeters: 20 })).status, 200);
+  for (const radiusMeters of [19.999,200000.001]) {
+    assert.equal((await api().post('/v1/branches').set(auth(admin.accessToken)).send({ ...body, radiusMeters })).status, 422);
+    assert.equal((await api().patch(`/v1/branches/${branchId}`).set(auth(admin.accessToken)).send({ radiusMeters })).status, 422);
+  }
+  assert.equal((await api().get(`/v1/branches/${branchId}`).set(auth(admin.accessToken))).body.data.radiusMeters, 20);
+});
+test('branch radius 200km remains admin managed and does not bypass location quality or geofence', async () => {
+  const { admin, office, employee, duty } = await workplace();
+  const manager = await account({ role: 'manager', branchId: office.id });
+  assert.equal((await api().patch(`/v1/branches/${office.id}`).set(auth(admin.accessToken)).send({ radiusMeters: 200000 })).status, 200);
+  for (const user of [manager,employee]) assert.equal((await api().patch(`/v1/branches/${office.id}`).set(auth(user.accessToken)).send({ radiusMeters: 200000 })).status, 403);
+  const body = { shiftId: duty.id, latitude: 11.7, longitude: 106, accuracyMeters: 5 };
+  assert.equal((await api().post('/v1/attendance/check-in').set(auth(employee.accessToken)).send({ ...body, accuracyMeters: 101 })).status, 422);
+  const outside = await api().post('/v1/attendance/check-in').set(auth(employee.accessToken)).send({ ...body, latitude: 12 });
+  assert.equal(outside.status, 422); assert.equal(outside.body.error.code, 'OUTSIDE_GEOFENCE');
+  const inside = await api().post('/v1/attendance/check-in').set(auth(employee.accessToken)).send(body);
+  assert.equal(inside.status, 201);
+  assert.equal(inside.body.data.employeeId, employee.id);
+});
 const factAnswersOf = row => row.criticalFacts.map(fact=>({factId:fact.id,value:fact.value}));
 const cameraResult = (extra={}) => ({clientRequestId:randomUUID(),sourceLanguage:'vi',targetLanguage:'en',originalText:'Bàn giao thiết bị EQ-12 lúc 22:00.',translatedText:'Hand over equipment EQ-12 at 22:00.',...extra});
 

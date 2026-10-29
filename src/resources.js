@@ -6,7 +6,7 @@ import { loadFace } from './auth.js';
 import { DEFAULT_TIME_POLICY, timePolicySchema, punchWindow, timingOf, createLocalClock } from './attendance-time.js';
 import { criticalFactSchema, validateCriticalFacts, verifyFactAnswers } from './critical-facts.js';
 
-const branchSchema = z.object({ name, address: z.string().trim().min(3).max(500), latitude: coordinates.latitude, longitude: coordinates.longitude, radiusMeters: z.number().finite().min(20).max(5000), timePolicy: timePolicySchema.optional() });
+const branchSchema = z.object({ name, address: z.string().trim().min(3).max(500), latitude: coordinates.latitude, longitude: coordinates.longitude, radiusMeters: z.number().finite().min(20).max(200000), timePolicy: timePolicySchema.optional() });
 const shiftSchema = z.object({ title: name, branchId: id, employeeId: id, startsAt: isoDate, endsAt: isoDate, status: z.literal('scheduled').optional() });
 const employeeSchema = z.object({ fullName: name, username, email, password, role: role.optional(), status: status.optional(), branchId: id.nullable().optional() });
 const correctionSchema = z.object({ shiftId: id, requestedCheckIn: isoDate.nullable().optional(), requestedCheckOut: isoDate.nullable().optional(), reason: z.string().trim().min(5).max(2000) });
