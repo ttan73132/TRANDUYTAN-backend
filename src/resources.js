@@ -4,6 +4,7 @@ import { z, id, name, username, email, password, role, status, isoDate, coordina
 import { fail, hashPassword, publicUser, transaction } from './security.js';
 import { loadFace } from './auth.js';
 import { DEFAULT_TIME_POLICY, timePolicySchema, punchWindow, timingOf, createLocalClock } from './attendance-time.js';
+import { criticalFactSchema, validateCriticalFacts, verifyFactAnswers } from './critical-facts.js';
 
 const branchSchema = z.object({ name, address: z.string().trim().min(3).max(500), latitude: coordinates.latitude, longitude: coordinates.longitude, radiusMeters: z.number().finite().min(20).max(5000), timePolicy: timePolicySchema.optional() });
 const shiftSchema = z.object({ title: name, branchId: id, employeeId: id, startsAt: isoDate, endsAt: isoDate, status: z.literal('scheduled').optional() });
@@ -11,7 +12,8 @@ const employeeSchema = z.object({ fullName: name, username, email, password, rol
 const correctionSchema = z.object({ shiftId: id, requestedCheckIn: isoDate.nullable().optional(), requestedCheckOut: isoDate.nullable().optional(), reason: z.string().trim().min(5).max(2000) });
 const itemSchema = z.object({ id, text: z.string().trim().min(1).max(1000), translatedText: z.string().max(2000), state: z.enum(['open','understood','clarify']).default('open') }).strict();
 const handoverSchema = z.object({ shiftId: id, recipientId: id, originalText: z.string().trim().min(1).max(12000), translatedText: z.string().max(24000),
-  sourceLanguage: z.enum(['vi','en','zh']), targetLanguage: z.enum(['vi','en','zh']), items: z.array(itemSchema).min(1).max(40), status: z.enum(['draft','submitted','acknowledged']).optional() });
+  sourceLanguage: z.enum(['vi','en','zh']), targetLanguage: z.enum(['vi','en','zh']), items: z.array(itemSchema).min(1).max(40),
+  criticalFacts: z.array(criticalFactSchema).max(3).optional(), status: z.enum(['draft','submitted','acknowledged']).optional() });
 const shiftSelect = 'SELECT s.*,u.full_name AS employee_name,b.name AS branch_name,a.id AS attendance_id,COALESCE(correction_stats.correction_count,0) AS correction_count FROM shifts s JOIN users u ON u.id=s.employee_id JOIN branches b ON b.id=s.branch_id LEFT JOIN attendance a ON a.shift_id=s.id AND a.employee_id=s.employee_id LEFT JOIN (SELECT shift_id,COUNT(*) AS correction_count FROM corrections GROUP BY shift_id) correction_stats ON correction_stats.shift_id=s.id';
 const attendanceSelect = 'SELECT a.*,u.full_name AS employee_name,b.name AS branch_name,s.title AS shift_title,s.starts_at AS shift_starts_at,s.ends_at AS shift_ends_at,s.time_policy_snapshot FROM attendance a JOIN shifts s ON s.id=a.shift_id JOIN users u ON u.id=a.employee_id JOIN branches b ON b.id=s.branch_id';
 const handoverFields = 'h.*,c.full_name AS created_by_name,r.full_name AS recipient_name,s.title AS shift_title,s.starts_at AS shift_starts_at';
@@ -21,6 +23,7 @@ const columns = {
   name: 'name', address: 'address', latitude: 'latitude', longitude: 'longitude', radiusMeters: 'radius_meters', timePolicy: 'time_policy',
   title: 'title', employeeId: 'employee_id', startsAt: 'starts_at', endsAt: 'ends_at', requestedCheckIn: 'requested_check_in', requestedCheckOut: 'requested_check_out', reason: 'reason',
   resolutionNote: 'resolution_note', recipientId: 'recipient_id', originalText: 'original_text', translatedText: 'translated_text', sourceLanguage: 'source_language', targetLanguage: 'target_language', items: 'items',
+  criticalFacts: 'critical_facts', criticalFactConfirmation: 'critical_fact_confirmation',
 };
 export function serialize(row) {
   return Object.fromEntries(Object.entries(row).map(([key, value]) => [key.replace(/_([a-z])/g, (_match, letter) => letter.toUpperCase()), value]));
@@ -32,7 +35,7 @@ const notFound = () => fail(404, 'NOT_FOUND', 'Không tìm thấy dữ liệu tr
 async function updateRow(db, table, recordId, changes) {
   const entries = Object.entries(changes);
   if (!entries.length || entries.some(([key]) => !columns[key])) fail(422, 'EMPTY_UPDATE', 'Nội dung cập nhật không hợp lệ.');
-  const values = entries.map(([key, value]) => ['items','timePolicy'].includes(key) ? JSON.stringify(value) : value);
+  const values = entries.map(([key, value]) => ['items','timePolicy','criticalFacts','criticalFactConfirmation'].includes(key) && value !== null ? JSON.stringify(value) : value);
   const fields = entries.map(([key], index) => `${columns[key]}=$${index + 1}`).join(',');
   // table/column identifiers come exclusively from this module, never request data.
   const result = await db.query(`UPDATE ${table} SET ${fields} WHERE id=$${values.length + 1} RETURNING *`, [...values, recordId]);
@@ -398,12 +401,14 @@ export function createResources({ pool, now, timeZone = 'Asia/Bangkok', enqueueN
   router.post('/handovers', async (req, res) => {
     const input = parse(handoverSchema.strict(), req.body); checkItems(input.items);
     if (input.status === 'acknowledged' || input.items.some(x => x.state !== 'open')) fail(403, 'RECIPIENT_CONFIRMATION_REQUIRED', 'Người nhận sẽ tự xác nhận các mục đã hiểu.');
+    const submitted = input.status === 'submitted';
+    const criticalFacts = validateCriticalFacts(input.criticalFacts ?? [], { originalText: input.originalText, translatedText: input.translatedText, required: submitted, requireAnchors: submitted });
     const result = await transaction(pool, async db => {
       const duty = await visibleShift(db, input.shiftId, req.user);
       if (duty.employee_id !== req.user.id) fail(403, 'FORBIDDEN', 'Bạn chỉ được tạo bàn giao gắn với ca của mình.');
       await eligibleRecipient(db, input.recipientId, duty.branch_id, req.user.id);
-      const inserted = await db.query('INSERT INTO handovers(id,shift_id,created_by,recipient_id,original_text,translated_text,source_language,target_language,items,status,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11) RETURNING *',
-        [randomUUID(), input.shiftId, req.user.id, input.recipientId, input.originalText, input.translatedText, input.sourceLanguage, input.targetLanguage, JSON.stringify(input.items), input.status ?? 'draft', now()]);
+      const inserted = await db.query('INSERT INTO handovers(id,shift_id,created_by,recipient_id,original_text,translated_text,source_language,target_language,items,status,critical_facts,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12) RETURNING *',
+        [randomUUID(), input.shiftId, req.user.id, input.recipientId, input.originalText, input.translatedText, input.sourceLanguage, input.targetLanguage, JSON.stringify(input.items), input.status ?? 'draft', JSON.stringify(criticalFacts), now()]);
       await revision(db, inserted.rows[0], req.user.id);
       if (inserted.rows[0].status === 'submitted') await enqueueNotification(db, { type: 'handover_submitted', entityId: inserted.rows[0].id, version: inserted.rows[0].version, recipientId: inserted.rows[0].recipient_id });
       return inserted.rows[0];
@@ -411,23 +416,30 @@ export function createResources({ pool, now, timeZone = 'Asia/Bangkok', enqueueN
   });
   router.patch('/handovers/:id', async (req, res) => {
     const recordId = routeId(req);
-    const input = parse(handoverSchema.omit({ shiftId: true }).partial().extend({ version: z.number().int().positive() }).strict(), req.body);
+    const input = parse(handoverSchema.omit({ shiftId: true }).partial().extend({ version: z.number().int().positive(), factAnswers: z.unknown().optional() }).strict(), req.body);
     if (Object.keys(input).length < 2) fail(422, 'EMPTY_UPDATE', 'Chưa có nội dung cần cập nhật.');
     const result = await transaction(pool, async db => {
       const current = await visibleHandover(db, recordId, req.user, true);
       if (input.version !== current.version) fail(409, 'VERSION_CONFLICT', 'Bàn giao đã thay đổi. Hãy tải lại trước khi xác nhận.');
-      if (current.status === 'acknowledged') fail(409, 'HANDOVER_ACKNOWLEDGED', 'Bàn giao đã được xác nhận. Hãy tạo bàn giao tiếp theo nếu cần bổ sung.');
+      if (current.status === 'acknowledged' && current.created_by !== req.user.id) fail(409, 'HANDOVER_ACKNOWLEDGED', 'Bàn giao đã xác nhận chỉ có thể được người gửi sửa và yêu cầu xác nhận lại.');
       const { version: expectedVersion, ...changes } = input;
       let fields;
       if (current.created_by === req.user.id) {
-        if (changes.status === 'acknowledged' || changes.items?.some(x => x.state !== 'open')) fail(403, 'RECIPIENT_CONFIRMATION_REQUIRED', 'Không được xác nhận thay người nhận.');
+        if (Object.hasOwn(changes, 'factAnswers') || changes.status === 'acknowledged' || changes.items?.some(x => x.state !== 'open')) fail(403, 'RECIPIENT_CONFIRMATION_REQUIRED', 'Không được xác nhận hoặc nhập câu trả lời thay người nhận.');
+        if (current.status !== 'draft' && changes.status === 'draft') fail(409, 'HANDOVER_ACTIVE_NO_DRAFT', 'Bàn giao đã gửi phải được sửa thành bản gửi mới, không chuyển về nháp để bỏ bước kiểm tra.');
         const duty = await find(db, 'shifts', current.shift_id);
         if (changes.recipientId) await eligibleRecipient(db, changes.recipientId, duty.branch_id, req.user.id);
         if (changes.items) checkItems(changes.items);
-        // Any author edit invalidates prior per-item acknowledgements.
-        fields = { ...changes, items: (changes.items ?? current.items).map(x => ({ ...x, state: 'open' })) };
+        const finalStatus = current.status === 'draft' ? (changes.status ?? 'draft') : 'submitted';
+        const criticalFacts = validateCriticalFacts(changes.criticalFacts ?? current.critical_facts ?? [], {
+          originalText: changes.originalText ?? current.original_text, translatedText: changes.translatedText ?? current.translated_text,
+          required: finalStatus === 'submitted', requireAnchors: finalStatus === 'submitted' });
+        // Every author amendment invalidates recipient evidence. Old proof remains
+        // in the immutable revision snapshot; the amended active row is resubmitted.
+        fields = { ...changes, status: finalStatus, criticalFacts, criticalFactConfirmation: null,
+          items: (changes.items ?? current.items).map(x => ({ ...x, state: 'open' })) };
       } else if (current.recipient_id === req.user.id) {
-        if (current.status !== 'submitted' || Object.keys(changes).some(x => !['items','status'].includes(x))) fail(403, 'FORBIDDEN', 'Người nhận chỉ được xác nhận các mục bàn giao đã gửi.');
+        if (current.status !== 'submitted' || Object.keys(changes).some(x => !['items','status','factAnswers'].includes(x))) fail(403, 'FORBIDDEN', 'Người nhận chỉ được xác nhận các mục và nhập lại thông tin của bàn giao đã gửi.');
         const requestedItems = changes.items ?? current.items;
         checkItems(requestedItems);
         if (requestedItems.length !== current.items.length) fail(422, 'ITEM_CONTENT_CHANGED', 'Người nhận không được sửa nội dung bàn giao.');
@@ -440,13 +452,20 @@ export function createResources({ pool, now, timeZone = 'Asia/Bangkok', enqueueN
         const items = current.items.map(x => ({ ...x, state: states.get(x.id) }));
         const finalStatus = changes.status ?? 'submitted';
         if (!['submitted','acknowledged'].includes(finalStatus) || (finalStatus === 'acknowledged' && items.some(x => x.state !== 'understood'))) fail(422, 'UNDERSTANDING_REQUIRED', 'Cần xác nhận đã hiểu tất cả mục trước khi hoàn tất.');
-        fields = { items, status: finalStatus };
+        if (Object.hasOwn(changes, 'factAnswers') && finalStatus !== 'acknowledged') fail(422, 'FACT_ANSWERS_FINAL_ONLY', 'Chỉ gửi câu trả lời khi xác nhận hoàn tất bàn giao.');
+        let confirmation = null;
+        if (finalStatus === 'acknowledged') {
+          const criticalFacts = validateCriticalFacts(current.critical_facts ?? [], { originalText: current.original_text, translatedText: current.translated_text, required: true, requireAnchors: true });
+          const answers = verifyFactAnswers(criticalFacts, changes.factAnswers);
+          confirmation = { verifiedBy: req.user.id, verifiedAt: now().toISOString(), version: expectedVersion + 1, answers };
+        }
+        fields = { items, status: finalStatus, criticalFactConfirmation: confirmation };
       } else fail(403, 'FORBIDDEN', 'Chỉ người bàn giao hoặc người nhận được thay đổi phiếu.');
       await updateRow(db, 'handovers', recordId, fields);
       const changed = await db.query('UPDATE handovers SET version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *', [now(), recordId, expectedVersion]);
       if (!changed.rows[0]) fail(409, 'VERSION_CONFLICT', 'Bàn giao đã thay đổi. Hãy tải lại.');
       await revision(db, changed.rows[0], req.user.id);
-      if (current.status !== 'submitted' && changed.rows[0].status === 'submitted') await enqueueNotification(db, { type: 'handover_submitted', entityId: recordId, version: changed.rows[0].version, recipientId: changed.rows[0].recipient_id });
+      if (current.created_by === req.user.id && changed.rows[0].status === 'submitted') await enqueueNotification(db, { type: 'handover_submitted', entityId: recordId, version: changed.rows[0].version, recipientId: changed.rows[0].recipient_id });
       return changed.rows[0];
     }); res.json({ data: serialize(result) });
   });

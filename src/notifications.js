@@ -59,7 +59,11 @@ export function createNotifications({ pool, config, now = () => new Date(), prov
       return row?.employee_id === event.recipient_id && ['approved','rejected'].includes(row.status);
     }
     const row = (await pool.query('SELECT recipient_id,status FROM handovers WHERE id=$1', [event.entity_id])).rows[0];
-    return row?.recipient_id === event.recipient_id && row.status === 'submitted';
+    if (row?.recipient_id !== event.recipient_id || row.status !== 'submitted') return false;
+    // Recipient item updates also increment the row version. Compare submission
+    // events, not the generic row version, when superseding an older author event.
+    const newest = (await pool.query("SELECT entity_version FROM notification_outbox WHERE event_type='handover_submitted' AND entity_id=$1 ORDER BY entity_version DESC LIMIT 1", [event.entity_id])).rows[0];
+    return !newest || newest.entity_version <= event.entity_version;
   }
   async function finish(event, status, code = null) {
     await pool.query('UPDATE notification_outbox SET status=$1,last_error_code=$2,completed_at=$3 WHERE id=$4', [status, code, now(), event.id]);

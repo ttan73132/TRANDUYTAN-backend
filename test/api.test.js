@@ -6,6 +6,7 @@ import request from 'supertest';
 import { newDb } from 'pg-mem';
 import { createApp } from '../src/app.js';
 import { PushDeliveryError } from '../src/fcm.js';
+import { createNotifications } from '../src/notifications.js';
 
 let pool, app, mail, timestamp, serial, pushes, pushError;
 const password = 'A-long-test-password-29';
@@ -82,6 +83,70 @@ async function advanceTo(time, ...users) {
   }
 }
 const fid = n => `c${String(n).padStart(21, '0')}`;
+const factAnswersOf = row => row.criticalFacts.map(fact=>({factId:fact.id,value:fact.value}));
+async function criticalHandover({ employee, recipient, duty, extra={} }) {
+  const result = await api().post('/v1/handovers').set(auth(employee.accessToken)).send({shiftId:duty.id,recipientId:recipient.id,
+    originalText:'Thiết bị EQ-12; số lượng 12.5; hạn 2026-10-29 17:30.',translatedText:'Equipment EQ-12; quantity 12.5; deadline 2026-10-29 17:30.',
+    sourceLanguage:'vi',targetLanguage:'en',items:[{id:randomUUID(),text:'Kiểm tra hàng',translatedText:'Check inventory',state:'open'}],
+    criticalFacts:[{id:randomUUID(),kind:'equipment',label:'Mã thiết bị',value:'EQ-12'},{id:randomUUID(),kind:'quantity',label:'Số lượng',value:'12.5'},{id:randomUUID(),kind:'deadline',label:'Hạn chót',value:'2026-10-29 17:30'}],status:'submitted',...extra});
+  assert.equal(result.status,201,JSON.stringify(result.body)); return result.body.data;
+}
+test('critical handover drafts allow partial composition but submission enforces 1-3 anchored valid facts', async()=>{
+  const {employee,office,duty}=await workplace();const recipient=await account({branchId:office.id});
+  const draft=await criticalHandover({employee,recipient,duty,extra:{status:'draft',criticalFacts:[]}});
+  assert.deepEqual(draft.criticalFacts,[]);assert.equal(draft.criticalFactConfirmation,null);
+  let response=await api().patch(`/v1/handovers/${draft.id}`).set(auth(employee.accessToken)).send({version:1,status:'submitted'});
+  assert.equal(response.status,422);assert.equal(response.body.error.code,'CRITICAL_FACTS_REQUIRED');
+  const fact={id:randomUUID(),kind:'quantity',label:'Số lượng',value:'１２,５０'};
+  response=await api().patch(`/v1/handovers/${draft.id}`).set(auth(employee.accessToken)).send({version:1,criticalFacts:[fact],originalText:'Chưa soạn xong',translatedText:'Not composed yet'});
+  assert.equal(response.status,200);assert.equal(response.body.data.status,'draft');assert.equal(response.body.data.criticalFacts[0].value,'12.5');
+  response=await api().patch(`/v1/handovers/${draft.id}`).set(auth(employee.accessToken)).send({version:2,status:'submitted',originalText:'Số lượng 12.5',translatedText:'Quantity 112.5'});
+  assert.equal(response.status,422);assert.equal(response.body.error.code,'CRITICAL_FACT_NOT_ANCHORED');
+  response=await api().patch(`/v1/handovers/${draft.id}`).set(auth(employee.accessToken)).send({version:2,status:'submitted',originalText:'Số lượng １２,５０',translatedText:'Quantity 12.500'});
+  assert.equal(response.status,200);assert.equal(response.body.data.version,3);assert.equal(response.body.data.status,'submitted');
+});
+test('wrong or forged critical-fact answers leave items, version, proof and revisions unchanged',async()=>{
+  const {admin,employee,office,duty}=await workplace();const recipient=await account({branchId:office.id});const outsider=await account({branchId:office.id});
+  const row=await criticalHandover({employee,recipient,duty}); const items=row.items.map(item=>({...item,state:'understood'}));const correct=factAnswersOf(row);
+  const cases=[{answers:undefined,code:'FACT_ANSWERS_REQUIRED'},{answers:[...correct.slice(0,2),{factId:row.criticalFacts[2].id,value:'2026-10-29 17:31'}],code:'FACT_ANSWER_MISMATCH'},
+    {answers:[correct[0],correct[0],correct[2]],code:'FACT_ANSWERS_INVALID'},{answers:[...correct,{factId:randomUUID(),value:'12'}],code:'FACT_ANSWERS_INVALID'},
+    {answers:[{factId:randomUUID(),value:'EQ-12'},...correct.slice(1)],code:'FACT_ANSWERS_INVALID'}];
+  for(const scenario of cases){const response=await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:row.version,items,status:'acknowledged',...(scenario.answers?{factAnswers:scenario.answers}:{})});
+    assert.equal(response.status,422);assert.equal(response.body.error.code,scenario.code);
+    const unchanged=(await api().get(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken))).body.data;
+    assert.equal(unchanged.version,1);assert.equal(unchanged.status,'submitted');assert.equal(unchanged.items[0].state,'open');assert.equal(unchanged.criticalFactConfirmation,null);
+    assert.equal((await api().get(`/v1/handovers/${row.id}/revisions`).set(auth(recipient.accessToken))).body.data.length,1);}
+  for(const user of [employee,admin]) assert.equal((await api().patch(`/v1/handovers/${row.id}`).set(auth(user.accessToken)).send({version:1,status:'acknowledged',items,factAnswers:correct})).status,403);
+  assert.equal((await api().patch(`/v1/handovers/${row.id}`).set(auth(outsider.accessToken)).send({version:1,status:'acknowledged',items,factAnswers:correct})).status,404);
+  assert.equal((await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:1,status:'submitted',factAnswers:correct})).body.error.code,'FACT_ANSWERS_FINAL_ONLY');
+  assert.equal((await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:1,criticalFactConfirmation:{verifiedBy:recipient.id}})).status,422);
+  assert.equal((await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:1,criticalFacts:row.criticalFacts})).status,403);
+  const accepted=await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:1,status:'acknowledged',items,factAnswers:[{...correct[0],value:'ｅｑ－１２'},{...correct[1],value:'１２,５０'},correct[2]]});
+  assert.equal(accepted.status,200);assert.equal(accepted.body.data.criticalFactConfirmation.version,2);assert.equal(accepted.body.data.criticalFactConfirmation.verifiedBy,recipient.id);assert.equal(accepted.body.data.criticalFactConfirmation.answers[1].value,'12.5');
+});
+test('author amendments reopen acknowledged handovers and invalidate previous recipient proof with audit preserved',async()=>{
+  const {employee,office,duty}=await workplace();const recipient=await account({branchId:office.id});
+  const row=await criticalHandover({employee,recipient,duty});const understood=row.items.map(item=>({...item,state:'understood'}));
+  assert.equal((await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:1,status:'acknowledged',items:understood,factAnswers:factAnswersOf(row)})).status,200);
+  let changed=await api().patch(`/v1/handovers/${row.id}`).set(auth(employee.accessToken)).send({version:2,originalText:'Thiết bị EQ-12; số lượng 13; hạn 2026-10-29 17:30.',translatedText:'Equipment EQ-12; quantity 13; deadline 2026-10-29 17:30.',criticalFacts:row.criticalFacts.map(fact=>fact.kind==='quantity'?{...fact,value:'13'}:fact)});
+  assert.equal(changed.status,200);changed=changed.body.data;assert.equal(changed.version,3);assert.equal(changed.status,'submitted');assert.equal(changed.items[0].state,'open');assert.equal(changed.criticalFactConfirmation,null);
+  const history=(await api().get(`/v1/handovers/${row.id}/revisions`).set(auth(recipient.accessToken))).body.data;
+  assert.equal(history.length,3);assert.equal(history[1].snapshot.criticalFactConfirmation.verifiedBy,recipient.id);assert.equal(history[2].snapshot.criticalFactConfirmation,null);
+  assert.equal((await api().patch(`/v1/handovers/${row.id}`).set(auth(employee.accessToken)).send({version:3,status:'draft',criticalFacts:[]})).status,409);
+  assert.equal((await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:2,status:'acknowledged',items:understood,factAnswers:factAnswersOf(row)})).status,409);
+  const staleAnswers=await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:3,status:'acknowledged',items:understood,factAnswers:factAnswersOf(row)});
+  assert.equal(staleAnswers.status,422);assert.equal(staleAnswers.body.error.code,'FACT_ANSWER_MISMATCH');
+  const accepted=await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:3,status:'acknowledged',items:understood,factAnswers:factAnswersOf(changed)});
+  assert.equal(accepted.status,200);assert.equal(accepted.body.data.criticalFactConfirmation.version,4);
+});
+test('legacy handovers remain readable but cannot be acknowledged until author adds anchored critical facts',async()=>{
+  const {employee,office,duty}=await workplace();const recipient=await account({branchId:office.id});
+  const row=await criticalHandover({employee,recipient,duty});await pool.query("UPDATE handovers SET critical_facts='[]'::jsonb WHERE id=$1",[row.id]);
+  const response=await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:1,status:'acknowledged',items:row.items.map(item=>({...item,state:'understood'})),factAnswers:[]});
+  assert.equal(response.status,422);assert.equal(response.body.error.code,'CRITICAL_FACTS_REQUIRED');
+  const amended=await api().patch(`/v1/handovers/${row.id}`).set(auth(employee.accessToken)).send({version:1,criticalFacts:row.criticalFacts});assert.equal(amended.status,200);
+  const accepted=await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:2,status:'acknowledged',items:row.items.map(item=>({...item,state:'understood'})),factAnswers:factAnswersOf(amended.body.data)});assert.equal(accepted.status,200);
+});
 async function linkDevice(user, installationId = fid(1)) {
   const response = await api().post('/v1/notification-devices').set(auth(user.accessToken)).send({ installationId, firebaseProjectId: 'test-project', platform: 'android' });
   assert.equal(response.status, 201, JSON.stringify(response.body));
@@ -210,18 +275,36 @@ test('correction decisions notify once; pending edits and self-review failures n
   await app.locals.notifications.drain();
   assert.equal(pushes.length, 1); assert.equal(pushes[0].event_type, 'correction_reviewed'); assert.equal(pushes[0].entity_id, correctionId);
 });
-test('handover notifications target the recipient only when moving into submitted state', async () => {
+test('handover notifications target the latest author submission or amendment only', async () => {
   const { employee, office, duty } = await workplace();
   const recipient = await account({ branchId: office.id });
   await linkDevice(employee); await linkDevice(recipient, fid(2));
-  const body = { shiftId: duty.id, recipientId: recipient.id, originalText: 'Check the stock', translatedText: 'Kiểm tra hàng', sourceLanguage: 'en', targetLanguage: 'vi', items: [{ id: randomUUID(), text: 'Count items', translatedText: 'Đếm hàng', state: 'open' }] };
+  const body = { shiftId: duty.id, recipientId: recipient.id, originalText: 'Check stock 12', translatedText: 'Kiểm tra hàng 12', criticalFacts: [{id:randomUUID(),kind:'quantity',label:'Quantity',value:'12'}], sourceLanguage: 'en', targetLanguage: 'vi', items: [{ id: randomUUID(), text: 'Count items', translatedText: 'Đếm hàng', state: 'open' }] };
   const draft = (await api().post('/v1/handovers').set(auth(employee.accessToken)).send(body)).body.data;
   assert.equal((await pool.query('SELECT id FROM notification_outbox')).rows.length, 0);
   const submitted = await api().patch(`/v1/handovers/${draft.id}`).set(auth(employee.accessToken)).send({ version: draft.version, status: 'submitted' });
   assert.equal(submitted.status, 200);
-  await api().patch(`/v1/handovers/${draft.id}`).set(auth(employee.accessToken)).send({ version: submitted.body.data.version, originalText: 'Check remaining stock' });
+  await api().patch(`/v1/handovers/${draft.id}`).set(auth(employee.accessToken)).send({ version: submitted.body.data.version, originalText: 'Check remaining stock 12' });
   await app.locals.notifications.drain();
   assert.equal(pushes.length, 1); assert.equal(pushes[0].recipient_id, recipient.id); assert.equal(pushes[0].event_type, 'handover_submitted');
+});
+test('concurrent workers skip superseded author events but not recipient-only version changes', async()=>{
+  const {employee,office,duty}=await workplace();const recipient=await account({branchId:office.id});await linkDevice(recipient);
+  const row=await criticalHandover({employee,recipient,duty});
+  let current=(await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:1,items:row.items.map(item=>({...item,state:'clarify'}))})).body.data;
+  assert.equal(current.version,2);assert.equal((await pool.query('SELECT id FROM notification_outbox')).rows.length,1);
+  await app.locals.notifications.drain();assert.equal(pushes.length,1);assert.equal(pushes[0].entity_version,1,'recipient partial update must not suppress original submission event');
+  current=(await api().patch(`/v1/handovers/${row.id}`).set(auth(employee.accessToken)).send({version:2,originalText:row.originalText+' Ghi chú mới.'})).body.data;
+  assert.equal(current.version,3);
+  current=(await api().patch(`/v1/handovers/${row.id}`).set(auth(employee.accessToken)).send({version:3,translatedText:row.translatedText+' New note.'})).body.data;
+  assert.equal(current.version,4);
+  current=(await api().patch(`/v1/handovers/${row.id}`).set(auth(recipient.accessToken)).send({version:4,items:current.items.map(item=>({...item,state:'clarify'}))})).body.data;
+  assert.equal(current.version,5);assert.equal((await pool.query('SELECT id FROM notification_outbox')).rows.length,3);
+  const second=createNotifications({pool,config:{fcmEnabled:true,fcmProjectId:'test-project'},now:()=>new Date(timestamp),provider:{async send(fid,event){pushes.push({fid,...event});}}});
+  await Promise.all([app.locals.notifications.drain(),second.drain()]);await second.stop();
+  assert.equal(pushes.length,2);assert.equal(pushes[1].entity_version,4);
+  const events=(await pool.query('SELECT entity_version,status FROM notification_outbox ORDER BY entity_version')).rows;
+  assert.deepEqual(events.map(event=>[event.entity_version,event.status]),[[1,'sent'],[3,'skipped'],[4,'sent']]);
 });
 
 test('registration does not authenticate before the email code and creates a pending employee', async () => {
@@ -380,14 +463,15 @@ test('handover understanding is recorded by its recipient with optimistic versio
   const { employee, duty, office } = await workplace();
   const recipient = await account({ branchId: office.id });
   const create = await api().post('/v1/handovers').set(auth(employee.accessToken)).send({
-    shiftId: duty.id, recipientId: recipient.id, originalText: 'Check the door', translatedText: 'Kiểm tra cửa',
+    shiftId: duty.id, recipientId: recipient.id, originalText: 'Check door EQ-12', translatedText: 'Kiểm tra cửa EQ-12',
+    criticalFacts: [{id:randomUUID(),kind:'equipment',label:'Door equipment',value:'EQ-12'}],
     sourceLanguage: 'en', targetLanguage: 'vi', status: 'submitted', items: [{ id: randomUUID(), text: 'Check the door', translatedText: 'Kiểm tra cửa', state: 'open' }],
   });
   assert.equal(create.status, 201);
   const handover = create.body.data;
   const understood = handover.items.map(x => ({ ...x, state: 'understood' }));
   assert.equal((await api().patch(`/v1/handovers/${handover.id}`).set(auth(employee.accessToken)).send({ version: 1, status: 'acknowledged', items: understood })).status, 403);
-  const accepted = await api().patch(`/v1/handovers/${handover.id}`).set(auth(recipient.accessToken)).send({ version: 1, status: 'acknowledged', items: understood });
+  const accepted = await api().patch(`/v1/handovers/${handover.id}`).set(auth(recipient.accessToken)).send({ version: 1, status: 'acknowledged', items: understood, factAnswers: handover.criticalFacts.map(fact=>({factId:fact.id,value:fact.value})) });
   assert.equal(accepted.status, 200);
   assert.equal(accepted.body.data.version, 2);
   assert.equal(accepted.body.data.status, 'acknowledged');
@@ -459,7 +543,8 @@ test('authorized handover recipients receive names and shift context without gai
   const otherBranch = await branch(admin, 'Other metadata branch');
   const unrelatedManager = await account({ role: 'manager', branchId: otherBranch.id });
   const created = await api().post('/v1/handovers').set(auth(employee.accessToken)).send({
-    shiftId: duty.id, recipientId: recipient.id, originalText: 'Lock the storage door', translatedText: 'Khóa cửa kho',
+    shiftId: duty.id, recipientId: recipient.id, originalText: 'Lock storage door EQ-12', translatedText: 'Khóa cửa kho EQ-12',
+    criticalFacts: [{id:randomUUID(),kind:'equipment',label:'Door equipment',value:'EQ-12'}],
     sourceLanguage: 'en', targetLanguage: 'vi', status: 'submitted',
     items: [{ id: randomUUID(), text: 'Lock the storage door', translatedText: 'Khóa cửa kho', state: 'open' }],
   });
