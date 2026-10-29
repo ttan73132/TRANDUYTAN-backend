@@ -52,7 +52,7 @@ export function distanceMeters(latitudeA, longitudeA, latitudeB, longitudeB) {
   return 6371000 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(Math.max(0, 1 - a)));
 }
 
-export function createResources({ pool, now, timeZone = 'Asia/Bangkok' }) {
+export function createResources({ pool, now, timeZone = 'Asia/Bangkok', enqueueNotification = async () => {} }) {
   const router = Router();
   const localClock = createLocalClock(timeZone);
   function shiftView(row) {
@@ -131,6 +131,7 @@ export function createResources({ pool, now, timeZone = 'Asia/Bangkok' }) {
       if (input.email && input.email !== employee.email) updated = (await db.query('UPDATE users SET email_verified=false WHERE id=$1 RETURNING *', [recordId])).rows[0];
       if (newPassword || input.email !== undefined || input.status === 'suspended') {
         await db.query('UPDATE sessions SET revoked_at=$1 WHERE user_id=$2 AND revoked_at IS NULL', [now(), recordId]);
+        await db.query('DELETE FROM notification_devices WHERE user_id=$1', [recordId]);
         await db.query('UPDATE otp_challenges SET consumed_at=$1 WHERE user_id=$2 AND consumed_at IS NULL', [now(), recordId]);
       }
       return updated;
@@ -147,6 +148,7 @@ export function createResources({ pool, now, timeZone = 'Asia/Bangkok' }) {
       await guardLastAdmin(db, employee, { deleted: true });
       await db.query("UPDATE users SET deleted_at=$1,status='suspended',branch_id=NULL WHERE id=$2", [now(), recordId]);
       await db.query('UPDATE sessions SET revoked_at=$1 WHERE user_id=$2', [now(), recordId]);
+      await db.query('DELETE FROM notification_devices WHERE user_id=$1', [recordId]);
       await db.query('DELETE FROM face_templates WHERE user_id=$1', [recordId]);
       await db.query('DELETE FROM location_shares WHERE user_id=$1', [recordId]);
     });
@@ -194,10 +196,14 @@ export function createResources({ pool, now, timeZone = 'Asia/Bangkok' }) {
     if (req.body?.status !== undefined && req.body.status !== 'scheduled') fail(422, 'SHIFT_STATUS_READ_ONLY', 'Ca mới bắt đầu ở trạng thái đã phân ca; trạng thái sau đó do hệ thống quản lý.');
     const input = parse(shiftSchema.strict(), req.body);
     if (!allowedBranch(req.user, input.branchId)) notFound(); checkTimes(input.startsAt, input.endsAt);
-    const branch = await eligibleAssignment(pool, input.employeeId, input.branchId);
-    const { rows } = await pool.query("INSERT INTO shifts(id,title,branch_id,employee_id,starts_at,ends_at,status,time_policy_snapshot,created_at) VALUES($1,$2,$3,$4,$5,$6,'scheduled',$7,$8) RETURNING *",
-      [randomUUID(), input.title, input.branchId, input.employeeId, input.startsAt, input.endsAt, JSON.stringify(branch.time_policy), now()]);
-    res.status(201).json({ data: shiftView(rows[0]) });
+    const result = await transaction(pool, async db => {
+      const branch = await eligibleAssignment(db, input.employeeId, input.branchId);
+      const { rows } = await db.query("INSERT INTO shifts(id,title,branch_id,employee_id,starts_at,ends_at,status,time_policy_snapshot,created_at) VALUES($1,$2,$3,$4,$5,$6,'scheduled',$7,$8) RETURNING *",
+        [randomUUID(), input.title, input.branchId, input.employeeId, input.startsAt, input.endsAt, JSON.stringify(branch.time_policy), now()]);
+      await enqueueNotification(db, { type: 'shift_assigned', entityId: rows[0].id, version: rows[0].assignment_version, recipientId: input.employeeId });
+      return rows[0];
+    });
+    res.status(201).json({ data: shiftView(result) });
   });
   router.patch('/shifts/:id', async (req, res) => {
     manage(req.user);
@@ -220,6 +226,10 @@ export function createResources({ pool, now, timeZone = 'Asia/Bangkok' }) {
       }
       await updateRow(db, 'shifts', recordId, input);
       if (planChanged) await db.query('UPDATE shifts SET time_policy_snapshot=$1 WHERE id=$2', [JSON.stringify(branch.time_policy), recordId]);
+      if (input.employeeId !== undefined && input.employeeId !== current.employee_id) {
+        const reassigned = (await db.query('UPDATE shifts SET assignment_version=assignment_version+1 WHERE id=$1 RETURNING *', [recordId])).rows[0];
+        await enqueueNotification(db, { type: 'shift_assigned', entityId: recordId, version: reassigned.assignment_version, recipientId: reassigned.employee_id });
+      }
       return (await db.query(`${shiftSelect} WHERE s.id=$1`, [recordId])).rows[0];
     }); res.json({ data: shiftView(result) });
   });
@@ -315,6 +325,7 @@ export function createResources({ pool, now, timeZone = 'Asia/Bangkok' }) {
       }
       const afterSnapshot = after ? JSON.stringify(serialize(after)) : null;
       const updated = await db.query('UPDATE corrections SET status=$1,resolution_note=$2,resolved_by=$3,updated_at=$4,resolved_at=$4,before_attendance=$5,after_attendance=$6 WHERE id=$7 RETURNING *', [input.status, input.resolutionNote ?? '', req.user.id, now(), beforeSnapshot, afterSnapshot, recordId]);
+      await enqueueNotification(db, { type: 'correction_reviewed', entityId: recordId, recipientId: current.employee_id });
       return updated.rows[0];
     }); res.json({ data: serialize(result) });
   });
@@ -393,7 +404,9 @@ export function createResources({ pool, now, timeZone = 'Asia/Bangkok' }) {
       await eligibleRecipient(db, input.recipientId, duty.branch_id, req.user.id);
       const inserted = await db.query('INSERT INTO handovers(id,shift_id,created_by,recipient_id,original_text,translated_text,source_language,target_language,items,status,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11) RETURNING *',
         [randomUUID(), input.shiftId, req.user.id, input.recipientId, input.originalText, input.translatedText, input.sourceLanguage, input.targetLanguage, JSON.stringify(input.items), input.status ?? 'draft', now()]);
-      await revision(db, inserted.rows[0], req.user.id); return inserted.rows[0];
+      await revision(db, inserted.rows[0], req.user.id);
+      if (inserted.rows[0].status === 'submitted') await enqueueNotification(db, { type: 'handover_submitted', entityId: inserted.rows[0].id, version: inserted.rows[0].version, recipientId: inserted.rows[0].recipient_id });
+      return inserted.rows[0];
     }); res.status(201).json({ data: serialize(result) });
   });
   router.patch('/handovers/:id', async (req, res) => {
@@ -432,7 +445,9 @@ export function createResources({ pool, now, timeZone = 'Asia/Bangkok' }) {
       await updateRow(db, 'handovers', recordId, fields);
       const changed = await db.query('UPDATE handovers SET version=version+1,updated_at=$1 WHERE id=$2 AND version=$3 RETURNING *', [now(), recordId, expectedVersion]);
       if (!changed.rows[0]) fail(409, 'VERSION_CONFLICT', 'Bàn giao đã thay đổi. Hãy tải lại.');
-      await revision(db, changed.rows[0], req.user.id); return changed.rows[0];
+      await revision(db, changed.rows[0], req.user.id);
+      if (current.status !== 'submitted' && changed.rows[0].status === 'submitted') await enqueueNotification(db, { type: 'handover_submitted', entityId: recordId, version: changed.rows[0].version, recipientId: changed.rows[0].recipient_id });
+      return changed.rows[0];
     }); res.json({ data: serialize(result) });
   });
   router.delete('/handovers/:id', async (req, res) => {

@@ -5,25 +5,29 @@ import { randomUUID } from 'node:crypto';
 import request from 'supertest';
 import { newDb } from 'pg-mem';
 import { createApp } from '../src/app.js';
+import { PushDeliveryError } from '../src/fcm.js';
 
-let pool, app, mail, timestamp, serial;
+let pool, app, mail, timestamp, serial, pushes, pushError;
 const password = 'A-long-test-password-29';
 beforeEach(async () => {
   const db = newDb();
+  db.public.registerFunction({ name: 'length', args: ['text'], returns: 'integer', implementation: value => value.length });
   const migrations = new URL('../migrations/', import.meta.url);
   for (const file of (await readdir(migrations)).filter(file => /^\d+_.*\.sql$/.test(file)).sort()) db.public.none(await readFile(new URL(file, migrations), 'utf8'));
   const adapter = db.adapters.createPg();
   pool = new adapter.Pool();
   mail = [];
   serial = 0;
+  pushes = []; pushError = null;
   timestamp = Date.now();
   app = createApp({ pool, config: {
     jwtSecret: 'test-only-jwt-secret-with-at-least-32-characters',
     otpSecret: 'test-only-otp-secret-with-at-least-32-characters',
     issuer: 'attendance-api', audience: 'attendance-app',
+    fcmEnabled: true, fcmProjectId: 'test-project',
   }, now: () => new Date(timestamp), mailer: {
     async sendOtp(message) { mail.push(message); },
-  } });
+  }, pushProvider: { async send(fid, event) { if (pushError) throw pushError; pushes.push({ fid, ...event }); } } });
 });
 afterEach(async () => pool.end());
 const api = () => request(app);
@@ -77,6 +81,148 @@ async function advanceTo(time, ...users) {
     user.refreshToken = response.body.data.refreshToken;
   }
 }
+const fid = n => `c${String(n).padStart(21, '0')}`;
+async function linkDevice(user, installationId = fid(1)) {
+  const response = await api().post('/v1/notification-devices').set(auth(user.accessToken)).send({ installationId, firebaseProjectId: 'test-project', platform: 'android' });
+  assert.equal(response.status, 201, JSON.stringify(response.body));
+  assert.equal(response.body.data.recipientId, user.id);
+  return response.body.data;
+}
+
+test('push registration requires an active account, matching project and current-session ownership', async () => {
+  const pending = await account({ status: 'pending' });
+  assert.equal((await api().post('/v1/notification-devices').set(auth(pending.accessToken)).send({ installationId: fid(1), firebaseProjectId: 'test-project', platform: 'android' })).status, 403);
+  const user = await account(), other = await account();
+  assert.equal((await api().post('/v1/notification-devices').set(auth(user.accessToken)).send({ installationId: fid(1), firebaseProjectId: 'different-project', platform: 'android' })).status, 422);
+  const device = await linkDevice(user);
+  const repeated = await linkDevice(user);
+  assert.equal(repeated.id, device.id);
+  assert.equal((await api().delete(`/v1/notification-devices/${device.id}`).set(auth(other.accessToken))).status, 404);
+  const status = await api().get('/v1/notifications/status').set(auth(user.accessToken));
+  assert.deepEqual(status.body.data, { enabled: true, provider: 'fcm', firebaseProjectId: 'test-project' });
+  assert.equal((await api().delete(`/v1/notification-devices/${device.id}`).set(auth(user.accessToken))).status, 200);
+});
+test('shift outbox is transactional, deduplicated, and emits only creation or actual reassignment', async () => {
+  const { admin, office, employee } = await workplace();
+  const other = await account({ branchId: office.id });
+  await linkDevice(employee); await linkDevice(other, fid(2));
+  const duty = await shift(admin, employee, office.id);
+  let rows = (await pool.query('SELECT * FROM notification_outbox')).rows;
+  assert.equal(rows.length, 1); assert.equal(rows[0].recipient_id, employee.id);
+  assert.equal(pushes.length, 0, 'HTTP response does not wait for or fake a provider send');
+  await api().patch(`/v1/shifts/${duty.id}`).set(auth(admin.accessToken)).send({ title: 'Renamed only' });
+  await api().patch(`/v1/shifts/${duty.id}`).set(auth(admin.accessToken)).send({ employeeId: employee.id });
+  assert.equal((await pool.query('SELECT id FROM notification_outbox')).rows.length, 1);
+  const invalid = await api().post('/v1/shifts').set(auth(admin.accessToken)).send({ title: 'Rejected shift', branchId: office.id, employeeId: employee.id, startsAt: new Date(timestamp + 1000).toISOString(), endsAt: new Date(timestamp).toISOString() });
+  assert.equal(invalid.status, 422); assert.equal((await pool.query('SELECT id FROM notification_outbox')).rows.length, 1);
+  await api().patch(`/v1/shifts/${duty.id}`).set(auth(admin.accessToken)).send({ employeeId: other.id });
+  await app.locals.notifications.drain();
+  rows = (await pool.query('SELECT * FROM notification_outbox ORDER BY created_at')).rows;
+  assert.equal(rows.length, 2);
+  assert.equal(rows.find(row => row.recipient_id === employee.id).status, 'skipped');
+  assert.equal(pushes.length, 1); assert.equal(pushes[0].recipient_id, other.id); assert.equal(pushes[0].fid, fid(2));
+  await app.locals.notifications.drain(); assert.equal(pushes.length, 1);
+});
+test('logout, refresh replay, suspension and shared-device rebinding invalidate queued push targets', async () => {
+  const { admin, office, employee } = await workplace();
+  const other = await account({ branchId: office.id });
+  const old = await linkDevice(employee);
+  await shift(admin, employee, office.id);
+  const replacement = await linkDevice(other);
+  assert.notEqual(replacement.id, old.id);
+  assert.equal((await api().delete(`/v1/notification-devices/${replacement.id}`).set(auth(employee.accessToken))).status, 404);
+  await app.locals.notifications.drain(); assert.equal(pushes.length, 0);
+  await shift(admin, other, office.id);
+  await api().post('/v1/auth/logout').send({ refreshToken: other.refreshToken });
+  assert.equal((await pool.query('SELECT id FROM notification_devices WHERE user_id=$1', [other.id])).rows.length, 0);
+  await app.locals.notifications.drain(); assert.equal(pushes.length, 0);
+  await linkDevice(employee, fid(3)); await shift(admin, employee, office.id);
+  await api().patch(`/v1/employees/${employee.id}`).set(auth(admin.accessToken)).send({ status: 'suspended' });
+  await app.locals.notifications.drain(); assert.equal(pushes.length, 0);
+  assert.equal((await pool.query('SELECT id FROM notification_devices WHERE user_id=$1', [employee.id])).rows.length, 0);
+  const replayUser = await account({ branchId: office.id });
+  await linkDevice(replayUser, fid(4)); await shift(admin, replayUser, office.id);
+  const original = replayUser.refreshToken;
+  assert.equal((await api().post('/v1/auth/refresh').send({ refreshToken: original })).status, 200);
+  assert.equal((await api().post('/v1/auth/refresh').send({ refreshToken: original })).status, 401);
+  await app.locals.notifications.drain(); assert.equal(pushes.length, 0);
+  assert.equal((await pool.query('SELECT id FROM notification_devices WHERE user_id=$1', [replayUser.id])).rows.length, 0);
+});
+test('FCM outages preserve committed shifts, retry with backoff, and stop at six attempts', async () => {
+  const { admin, employee, office } = await workplace();
+  await linkDevice(employee);
+  const duty = await shift(admin, employee, office.id);
+  pushError = new PushDeliveryError('FCM_UNAVAILABLE', true);
+  await app.locals.notifications.drain();
+  let event = (await pool.query('SELECT * FROM notification_outbox')).rows[0];
+  assert.equal(event.status, 'queued'); assert.equal(event.attempts, 1);
+  assert.equal((await pool.query('SELECT id FROM shifts WHERE id=$1', [duty.id])).rows.length, 1);
+  await app.locals.notifications.drain(); assert.equal((await pool.query('SELECT attempts FROM notification_outbox')).rows[0].attempts, 1);
+  for (let i = 2; i <= 6; i++) { timestamp = new Date(event.available_at).getTime(); await app.locals.notifications.drain(); event = (await pool.query('SELECT * FROM notification_outbox')).rows[0]; }
+  assert.equal(event.status, 'dead'); assert.equal(event.attempts, 6); assert.equal(event.last_error_code, 'FCM_UNAVAILABLE');
+  assert.equal(pushes.length, 0);
+});
+test('push retry succeeds only after its due time and expired or unregistered targets stop safely', async () => {
+  const { admin, employee, office } = await workplace();
+  await linkDevice(employee);
+  await shift(admin, employee, office.id);
+  pushError = new PushDeliveryError('FCM_RATE_LIMITED', true);
+  await app.locals.notifications.drain();
+  let event = (await pool.query('SELECT * FROM notification_outbox')).rows[0];
+  pushError = null;
+  timestamp = new Date(event.available_at).getTime() - 1;
+  await app.locals.notifications.drain(); assert.equal(pushes.length, 0);
+  timestamp++;
+  await app.locals.notifications.drain(); assert.equal(pushes.length, 1);
+  event = (await pool.query('SELECT * FROM notification_outbox')).rows[0];
+  assert.equal(event.status, 'sent'); assert.equal(event.attempts, 2);
+  await advanceTo(timestamp, admin, employee);
+  await shift(admin, employee, office.id);
+  pushError = new PushDeliveryError('FCM_UNREGISTERED', false);
+  await app.locals.notifications.drain();
+  assert.equal((await pool.query('SELECT id FROM notification_devices')).rows.length, 0);
+  assert.equal((await pool.query("SELECT id FROM notification_outbox WHERE status='dead'")).rows.length, 1);
+  await linkDevice(employee, fid(2)); await shift(admin, employee, office.id);
+  timestamp += 24 * 3600000;
+  pushError = null; await app.locals.notifications.drain();
+  assert.equal(pushes.length, 1);
+  assert.equal((await pool.query("SELECT last_error_code FROM notification_outbox WHERE status='skipped'")).rows[0].last_error_code, 'EVENT_EXPIRED');
+});
+test('unconfigured push reports disabled and never accepts a pretend device registration', async () => {
+  const user = await account();
+  const disabledApp = createApp({ pool, config: { jwtSecret: 'test-only-jwt-secret-with-at-least-32-characters', otpSecret: 'test-only-otp-secret-with-at-least-32-characters' }, now: () => new Date(timestamp), mailer: { async sendOtp() {} } });
+  const status = await request(disabledApp).get('/v1/notifications/status').set(auth(user.accessToken));
+  assert.deepEqual(status.body.data, { enabled: false, provider: 'fcm', firebaseProjectId: null });
+  const rejected = await request(disabledApp).post('/v1/notification-devices').set(auth(user.accessToken)).send({ installationId: fid(1), firebaseProjectId: 'test-project', platform: 'android' });
+  assert.equal(rejected.status, 503); assert.equal(rejected.body.error.code, 'PUSH_DISABLED');
+  assert.equal((await pool.query('SELECT id FROM notification_devices')).rows.length, 0);
+});
+test('correction decisions notify once; pending edits and self-review failures never enqueue', async () => {
+  const { admin, employee, duty } = await workplace();
+  await linkDevice(employee);
+  const created = await api().post('/v1/corrections').set(auth(employee.accessToken)).send({ shiftId: duty.id, requestedCheckIn: new Date(timestamp).toISOString(), reason: 'Forgot check-in' });
+  const correctionId = created.body.data.id;
+  await api().patch(`/v1/corrections/${correctionId}`).set(auth(employee.accessToken)).send({ reason: 'Please check evidence' });
+  assert.equal((await api().patch(`/v1/corrections/${correctionId}`).set(auth(employee.accessToken)).send({ status: 'approved' })).status, 403);
+  assert.equal((await pool.query('SELECT id FROM notification_outbox')).rows.length, 0);
+  assert.equal((await api().patch(`/v1/corrections/${correctionId}`).set(auth(admin.accessToken)).send({ status: 'rejected', resolutionNote: 'No matching evidence' })).status, 200);
+  assert.equal((await api().patch(`/v1/corrections/${correctionId}`).set(auth(admin.accessToken)).send({ status: 'approved' })).status, 409);
+  await app.locals.notifications.drain();
+  assert.equal(pushes.length, 1); assert.equal(pushes[0].event_type, 'correction_reviewed'); assert.equal(pushes[0].entity_id, correctionId);
+});
+test('handover notifications target the recipient only when moving into submitted state', async () => {
+  const { employee, office, duty } = await workplace();
+  const recipient = await account({ branchId: office.id });
+  await linkDevice(employee); await linkDevice(recipient, fid(2));
+  const body = { shiftId: duty.id, recipientId: recipient.id, originalText: 'Check the stock', translatedText: 'Kiểm tra hàng', sourceLanguage: 'en', targetLanguage: 'vi', items: [{ id: randomUUID(), text: 'Count items', translatedText: 'Đếm hàng', state: 'open' }] };
+  const draft = (await api().post('/v1/handovers').set(auth(employee.accessToken)).send(body)).body.data;
+  assert.equal((await pool.query('SELECT id FROM notification_outbox')).rows.length, 0);
+  const submitted = await api().patch(`/v1/handovers/${draft.id}`).set(auth(employee.accessToken)).send({ version: draft.version, status: 'submitted' });
+  assert.equal(submitted.status, 200);
+  await api().patch(`/v1/handovers/${draft.id}`).set(auth(employee.accessToken)).send({ version: submitted.body.data.version, originalText: 'Check remaining stock' });
+  await app.locals.notifications.drain();
+  assert.equal(pushes.length, 1); assert.equal(pushes[0].recipient_id, recipient.id); assert.equal(pushes[0].event_type, 'handover_submitted');
+});
 
 test('registration does not authenticate before the email code and creates a pending employee', async () => {
   const result = await register();

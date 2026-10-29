@@ -14,17 +14,19 @@ try {
     const created = await bootstrapAdmin(pool, bootstrapInput(), { skipIfExists: true });
     if (created) console.log('Đã tạo quản trị viên đầu tiên. Xóa các biến BOOTSTRAP_ADMIN_* sau lần khởi động này.');
   }
-  const app = createApp({ pool, config, mailer: createMailer(config) });
+  const app = createApp({ pool, config, mailer: createMailer(config), autoStartNotifications: true });
   const server = app.listen(config.port, '0.0.0.0', () => console.log(`Attendance API listening on port ${config.port}.`));
+  app.locals.notifications.start();
   pool.on('error', () => console.error('Kết nối nền PostgreSQL bị gián đoạn.'));
   let shuttingDown = false;
   const close = () => {
     if (shuttingDown) return; shuttingDown = true;
-    server.close(async () => { await pool.end(); process.exitCode = 0; });
-    setTimeout(() => process.exit(1), 15000).unref();
+    const pushStopped = app.locals.notifications.stop();
+    server.close(async () => { await pushStopped; await pool.end(); process.exitCode = 0; });
+    setTimeout(() => process.exit(1), 25000).unref();
   };
   process.on('SIGTERM', close); process.on('SIGINT', close);
 } catch {
-  console.error('API chưa khởi động. Kiểm tra DATABASE_URL/TLS, JWT_SECRET, OTP_SECRET, EMAIL_PROVIDER và cấu hình email/bootstrap. Không có chế độ bỏ qua xác thực.');
+  console.error('API chưa khởi động. Kiểm tra DATABASE_URL/TLS, JWT_SECRET, OTP_SECRET, EMAIL_PROVIDER và cấu hình email/bootstrap/FCM. Không có chế độ bỏ qua xác thực.');
   await pool?.end(); process.exitCode = 1;
 }

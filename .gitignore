@@ -5,3 +5,8 @@ node_modules/
 coverage/
 *.log
 models/
+# Backend service-account/private-key material must stay outside the public repo.
+*service-account*.json
+*-firebase-adminsdk-*.json
+*.pem
+*.key

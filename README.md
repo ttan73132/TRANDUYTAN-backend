@@ -26,6 +26,7 @@ node tool/setup-env.js
 | `OTP_RELAY_SECRET` | Khóa riêng tối thiểu 32 ký tự, khác hai khóa trên; cùng giá trị với Script property của relay |
 | `BREVO_API_KEY` | Chỉ cần nếu chọn `EMAIL_PROVIDER=brevo` |
 | `BREVO_SENDER_EMAIL` | Chỉ cần với Brevo: địa chỉ người gửi đã cấu hình/xác minh |
+| `FCM_PROJECT_ID`, `FCM_SERVICE_ACCOUNT_JSON` | Tùy chọn: project ID và JSON khóa service account cùng dự án; bỏ trống cả hai để tắt push |
 | `BOOTSTRAP_ADMIN_FULL_NAME` | Tên quản trị viên đầu tiên |
 | `BOOTSTRAP_ADMIN_USERNAME` | Tên đăng nhập quản trị viên |
 | `BOOTSTRAP_ADMIN_EMAIL` | Email thật để nhận OTP |
@@ -68,6 +69,40 @@ Backend POST JSON `{payload,signature}`: `payload` là chuỗi JSON chứa đún
 [Quota Apps Script](https://developers.google.com/apps-script/guides/services/quotas) hiện nêu 100 người nhận/ngày cho tài khoản tiêu dùng như Gmail và có thể thay đổi. Relay kiểm `MailApp.getRemainingDailyQuota()` trước mỗi thư; không hứa gửi không giới hạn, không hứa thư đến tức thì. Gửi thư dùng [MailApp](https://developers.google.com/apps-script/reference/mail/mail-app), không dùng Gmail API/read scope.
 
 Brevo vẫn là phương án tùy chọn: đặt `EMAIL_PROVIDER=brevo`, điền `BREVO_API_KEY/BREVO_SENDER_EMAIL` đã xác minh; adapter dùng [Brevo HTTPS API](https://developers.brevo.com/docs/send-a-transactional-email). Những biến Brevo không bắt buộc khi chọn Apps Script, và không tự chuyển provider khi cấu hình lỗi.
+
+### Thông báo Firebase Cloud Messaging
+
+FCM dùng [HTTP v1 với OAuth ngắn hạn](https://firebase.google.com/docs/cloud-messaging/send/v1-api), scope duy nhất `https://www.googleapis.com/auth/firebase.messaging`, qua `google-auth-library` đã khóa phiên bản. Không thêm Firebase Authentication, Firestore, Cloud Functions hoặc gói thanh toán. [FCM được liệt kê là sản phẩm không tính phí](https://firebase.google.com/pricing); API và database vẫn chịu giới hạn riêng của Render Free.
+
+1. Trong Firebase project của nhóm ở gói Spark, đăng ký Android app đúng application ID của Flutter và bật Cloud Messaging API. File cấu hình Android thuộc frontend, không chứa khóa service account.
+2. Tạo service account dành riêng việc gửi thông báo, có quyền `cloudmessaging.messages.create` trong dự án; nếu dùng vai trò dựng sẵn, đối chiếu [Firebase Cloud Messaging API Admin](https://cloud.google.com/iam/docs/roles-permissions/firebasecloudmessaging). Không cần cấp Owner/Editor của toàn bộ dự án.
+3. Sau khi chủ tài khoản duyệt việc tạo khóa, đặt `FCM_PROJECT_ID` và toàn bộ nội dung JSON khóa vào **secret environment** của Render (`FCM_SERVICE_ACCOUNT_JSON`). Giữ khóa ngoài public repository, APK, log và ảnh chụp. JSON `project_id` phải trùng cấu hình; backend chỉ lấy `client_email/private_key`, không dùng endpoint do file credential tự chỉ định. Xóa/thu hồi khóa khi không dùng nữa.
+4. Chạy migration mới `003_push_notifications.sql` qua startup/migrate. Bỏ trống cả hai biến FCM thì API vẫn chạy, `GET /v1/notifications/status` báo `enabled:false`; đăng ký thiết bị trả `503 PUSH_DISABLED`. Chỉ điền một biến hoặc credential sai sẽ dừng startup, không giả báo đã bật thành công.
+5. Flutter SDK hiện tại dùng `register()/onRegistered/unregister()` và FID. Theo [REST Message](https://firebase.google.com/docs/reference/fcm/rest/v1/projects.messages), đích gửi là `message.fid`; không gọi FID là registration token cũ. Thử trên giả lập có Google Play services/Internet và quyền thông báo, xác nhận thông báo thật cả khi app ở nền trước khi báo hoàn thành tích hợp.
+
+Các endpoint dưới đây đều cần Bearer token của tài khoản đang active và đã xác minh email:
+
+| API | Body / kết quả trong `data` |
+|---|---|
+| `GET /notifications/status` | `{enabled,provider:'fcm',firebaseProjectId:string|null}` |
+| `POST /notification-devices` | Body `{installationId:<FID 22 ký tự>,firebaseProjectId,platform:'android'}`; kết quả `{id,recipientId,installationId,platform,registeredAt}` |
+| `DELETE /notification-devices/:id` | Chỉ đúng tài khoản và phiên sở hữu; kết quả `{deleted:true}` |
+
+FID là duy nhất, tối đa 10 thiết bị/tài khoản. Liên kết với `sid` của refresh session; refresh bình thường giữ nguyên sid. Đăng xuất, phát hiện refresh token bị dùng lại, đổi mật khẩu/email, khóa hoặc xóa người dùng sẽ gỡ liên kết. Khi FID được liên kết sang tài khoản/phiên khác, backend thay UUID của binding; thông báo đang chờ của binding cũ không thể đi theo FID sang chủ mới. Trước khi gửi, kể cả sau khi lấy OAuth token, worker kiểm lại user active/verified, session chưa thu hồi, refresh còn hiệu lực và sự kiện còn thuộc người nhận hiện tại. Máy chủ không nhận `userId` từ client để quyết định chủ thiết bị.
+
+Chỉ tạo outbox trong cùng transaction với: ca mới hoặc đổi người được phân ca; đơn điều chỉnh chuyển sang approved/rejected; bàn giao tạo ở submitted hoặc chuyển từ draft sang submitted. Sửa tiêu đề ca, sửa đơn pending hoặc sửa nội dung bàn giao đã submitted không phát thêm sự kiện. Các sự kiện dùng khóa loại/entity/version/binding để tránh nhân đôi. Chỉ thiết bị đang đăng ký hợp lệ tại thời điểm sự kiện được xếp hàng; không tạo lịch sử thông báo giả cho thiết bị chưa đăng ký. Việc xử lý lỗi provider diễn ra sau commit và không làm CRUD thất bại.
+
+Payload luôn có notification `{title:'Sổ ca HN',body:'Bạn có cập nhật mới. Mở ứng dụng để xem'}` và data **chỉ** ba chuỗi `{eventType,entityId,recipientId}`. Event type là `shift_assigned`, `correction_reviewed`, `handover_submitted`; hai ID là UUID, không có email, GPS, giờ chấm công, sinh trắc hoặc nội dung bàn giao. Client đối chiếu recipient với tài khoản active hiện tại rồi mới mở/fetch API có phân quyền. Android visibility là PRIVATE và FCM TTL chỉ 5 phút. Thông báo đã được Google nhận trước khi đăng xuất không thể thu hồi qua backend; nội dung khóa màn hình vẫn chung và app phải từ chối mở dữ liệu cho tài khoản khác.
+
+Worker chỉ hoạt động khi tiến trình API đang chạy: gọi sau phản hồi HTTP và kiểm hàng đợi mỗi 30 giây, không ping để giữ Render thức. Mỗi lượt tối đa 10 bản ghi, một lượt đồng thời trong mỗi process, claim có điều kiện nguyên tử; lease 2 phút phục hồi khi restart. Giới hạn 6 lần thử, backoff 1/2/4/8/16 phút và tôn trọng Retry-After, sự kiện hết hạn sau 24 giờ; lưu hàng đợi tối đa 7 ngày theo thời gian rồi dọn khi process thức. Đây là giới hạn TTL/retention, không phải cam kết số bản ghi tuyệt đối nếu lưu lượng nghiệp vụ tăng. FID UNREGISTERED bị gỡ, lỗi quyền/tham số kết thúc lần gửi; chỉ lưu mã lỗi an toàn, không lưu response/khóa/FID trong log. Render ngủ làm chậm thông báo; không cam kết giao tức thì. Sự cố sau Google nhận nhưng trước DB đánh dấu có thể gây gửi lại cùng thông báo chung (at-least-once), không thể hứa exactly-once qua mạng.
+
+Kiểm tra bổ sung PostgreSQL thật (tạo schema tạm duy nhất rồi tự dọn, không gửi Firebase) khi đã có `DATABASE_URL` và TLS phù hợp:
+
+```sh
+node --env-file-if-exists=.env tool/verify-notifications-postgres.js
+```
+
+Script kiểm rollback ca/outbox cùng transaction và hai worker tranh một bản ghi; không sửa bảng dữ liệu ứng dụng trong schema mặc định.
 
 ## Hợp đồng API
 
@@ -139,10 +174,10 @@ npm test
 npm audit --omit=dev --audit-level=high
 ```
 
-API tests chạy Express thật, SQL/schema thật qua `pg-mem`, thay riêng việc gửi email bằng mailbox trong test; OTP không bị giả lập ở handler. Các test mặt chạy model ONNX thật với fixture chính thức OpenCV, không thêm nhân viên hoặc template mẫu vào production. Tests relay thực thi Code.gs thật trong Node VM với stub các dịch vụ Google để kiểm chứng HMAC/freshness/replay/quota/throttle; adapter dùng boundary fetch được kiểm soát. Những test này không gửi email thật hoặc cấp quyền Google.
+API tests chạy Express thật và SQL/schema qua `pg-mem`, thay việc gửi email bằng mailbox và FCM bằng provider test; OTP không bị giả lập ở handler. `pg-mem` không chứng minh được rollback/khóa đồng thời của PostgreSQL. Các test mặt chạy model ONNX thật với fixture chính thức OpenCV, không thêm nhân viên hoặc template mẫu vào production. Tests relay thực thi Code.gs thật trong Node VM với stub các dịch vụ Google để kiểm chứng HMAC/freshness/replay/quota/throttle; adapter dùng boundary fetch được kiểm soát. Những test này không gửi email/push thật hoặc cấp quyền Google.
 
-Đã kiểm chứng kết nối tới database **PostgreSQL 17.11 trên Render Singapore** qua External URL với `rejectUnauthorized:true`, chạy `SELECT version()` thành công và chạy `applyMigrations(pool)` hai lần thành công, gồm `001_initial.sql` và `002_attendance_workflow.sql`. Điều này xác nhận kết nối/chứng chỉ, DDL, việc gọi advisory lock và tính idempotent của migration trên DB thật. Không suy rộng thành bằng chứng cho tranh chấp row lock/rollback đồng thời hoặc toàn bộ CRUD production. API Linux/Render, bootstrap admin và gửi/nhận email Google end-to-end còn phải kiểm chứng trong triển khai thực tế; camera/vị trí/micro cần tích hợp app/giả lập.
+Đã kiểm chứng kết nối tới database **PostgreSQL 17.11 trên Render Singapore** qua External URL với `rejectUnauthorized:true`, chạy `SELECT version()` thành công và chạy `applyMigrations(pool)` lặp lại thành công với cả `001_initial.sql`, `002_attendance_workflow.sql`, `003_push_notifications.sql`. Kiểm thử trong schema riêng trên cùng PostgreSQL thật xác nhận ca/outbox rollback cùng transaction và hai worker chỉ claim/gửi một lần qua provider kiểm thử; schema riêng đã được dọn sau khi chạy. Điều này xác nhận chứng chỉ, DDL, advisory lock, migration idempotent và hai tình huống transaction nêu trên; chưa chứng minh toàn bộ CRUD production hoặc gửi push thật. API Linux/Render, bootstrap admin và gửi/nhận email Google end-to-end còn phải kiểm chứng; camera/vị trí/micro cần tích hợp app/giả lập.
 
-Lần kiểm chứng cục bộ gần nhất: **65/65 tests đạt**, gồm 51 regression nghiệp vụ/mặt và 14 kiểm thử cấu hình/adapter/giao thức relay mới. Có các kiểm thử biên cửa sổ chấm công, ca qua đêm, ân hạn, snapshot chính sách, khóa kế hoạch, giữ dấu vết khi điều chỉnh và phạm vi báo cáo tháng. Đây không thay thế kiểm thử deployment.
+Lần kiểm chứng cục bộ gần nhất: **80/80 tests đạt**, gồm 65 regression nghiệp vụ/mặt/relay và 15 kiểm thử FCM về cấu hình, payload, quyền sở hữu thiết bị, phiên cũ, đổi tài khoản chung máy, sự kiện đúng người nhận, dedupe, backoff/Retry-After, giới hạn 6 lần thử, hết hạn, FID không còn đăng ký và provider bị tắt/lỗi. Migration003 và kiểm thử rollback/concurrent claim trên PostgreSQL thật đã đạt như mô tả trên; chưa gửi FCM thật. Có kiểm thử biên khung giờ chấm công, ca qua đêm, ân hạn, snapshot chính sách, khóa kế hoạch, dấu vết điều chỉnh và phạm vi báo cáo tháng. Đây không thay thế kiểm thử deployment.
 
 Thông tin kết nối, tài khoản và khóa thật được quản lý ngoài repository, không được đóng gói cùng frontend hoặc APK.

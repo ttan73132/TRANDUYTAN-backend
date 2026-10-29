@@ -125,6 +125,7 @@ export function createAuth({ pool, config, mailer, now }) {
       const session = (await db.query('SELECT * FROM sessions WHERE id=$1 FOR UPDATE', [token.session_id])).rows[0];
       if (token.consumed_at || new Date(token.expires_at) <= now()) {
         await db.query('UPDATE sessions SET revoked_at=$1 WHERE id=$2', [now(), token.session_id]);
+        await db.query('DELETE FROM notification_devices WHERE session_id=$1', [token.session_id]);
         return { error: loginFailure() };
       }
       const user = (await db.query('SELECT * FROM users WHERE id=$1 AND deleted_at IS NULL', [session.user_id])).rows[0];
@@ -137,7 +138,10 @@ export function createAuth({ pool, config, mailer, now }) {
   });
   router.post('/logout', async (req, res) => {
     const { refreshToken } = parse(z.object({ refreshToken: z.string().min(32).max(200) }).strict(), req.body);
-    await pool.query('UPDATE sessions SET revoked_at=$1 WHERE id IN (SELECT session_id FROM refresh_tokens WHERE token_hash=$2)', [now(), tokenHash(refreshToken)]);
+    await transaction(pool, async db => {
+      await db.query('UPDATE sessions SET revoked_at=$1 WHERE id IN (SELECT session_id FROM refresh_tokens WHERE token_hash=$2)', [now(), tokenHash(refreshToken)]);
+      await db.query('DELETE FROM notification_devices WHERE session_id IN (SELECT session_id FROM refresh_tokens WHERE token_hash=$1)', [tokenHash(refreshToken)]);
+    });
     res.json({ data: { loggedOut: true } });
   });
   router.post('/face-login', async (req, res) => {

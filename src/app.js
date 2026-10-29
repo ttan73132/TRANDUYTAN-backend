@@ -2,9 +2,12 @@ import express from 'express';
 import { ApiError, publicUser, rateLimit } from './security.js';
 import { createAuth } from './auth.js';
 import { createResources } from './resources.js';
+import { createNotifications } from './notifications.js';
 
-export function createApp({ pool, config, mailer, now = () => new Date() }) {
+export function createApp({ pool, config, mailer, now = () => new Date(), pushProvider, autoStartNotifications = false }) {
   const app = express();
+  const notifications = createNotifications({ pool, config, now, provider: pushProvider });
+  app.locals.notifications = notifications;
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy === true ? 1 : false);
   app.use((_req, res, next) => {
@@ -13,6 +16,10 @@ export function createApp({ pool, config, mailer, now = () => new Date() }) {
   });
   app.use(rateLimit({ now, max: 500 }));
   app.use(express.json({ limit: '3mb', strict: true }));
+  if (autoStartNotifications) app.use((req, res, next) => {
+    if (['POST','PATCH'].includes(req.method)) res.once('finish', () => { if (res.statusCode < 400) notifications.kick(); });
+    next();
+  });
   app.get(['/health','/v1/health'], async (_req, res) => {
     try { await pool.query('SELECT 1'); res.json({ data: { status: 'ok', service: 'attendance-api' } }); }
     catch { res.status(503).json({ error: { code: 'DATABASE_UNAVAILABLE', message: 'Cơ sở dữ liệu chưa sẵn sàng.' } }); }
@@ -20,7 +27,8 @@ export function createApp({ pool, config, mailer, now = () => new Date() }) {
   const auth = createAuth({ pool, config, mailer, now });
   app.use('/v1/auth', auth.router);
   app.get('/v1/me', auth.requireAuth, (req, res) => res.json({ data: publicUser(req.user) }));
-  app.use('/v1', auth.requireAuth, auth.requireActive, createResources({ pool, now, timeZone: config.timeZone }));
+  app.use('/v1', auth.requireAuth, auth.requireActive, notifications.router,
+    createResources({ pool, now, timeZone: config.timeZone, enqueueNotification: notifications.enqueue }));
   app.use((_req, res) => res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Không tìm thấy API.' } }));
   app.use((error, _req, res, _next) => {
     if (error instanceof ApiError) return res.status(error.status).json({ error: { code: error.code, message: error.message, ...(error.details ? { details: error.details } : {}) } });

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createPrivateKey } from 'node:crypto';
 
 function required(env, key) {
   const value = env[key]?.trim();
@@ -35,8 +36,20 @@ export function loadConfig(env = process.env) {
   const timeZone = env.APP_TIME_ZONE?.trim() || 'Asia/Bangkok';
   try { new Intl.DateTimeFormat('en-CA', { timeZone }).format(new Date()); }
   catch { throw new Error('APP_TIME_ZONE chưa hợp lệ.'); }
-  return { jwtSecret, otpSecret, emailProvider, ...mailConfig, issuer: 'attendance-api', audience: 'attendance-app',
+  return { jwtSecret, otpSecret, emailProvider, ...mailConfig, ...fcmConfig(env), issuer: 'attendance-api', audience: 'attendance-app',
     trustProxy: env.TRUST_PROXY === 'true', timeZone, port };
+}
+function fcmConfig(env) {
+  const project = env.FCM_PROJECT_ID?.trim(), json = env.FCM_SERVICE_ACCOUNT_JSON?.trim();
+  if (!project && !json) return { fcmEnabled: false, fcmProjectId: null };
+  try {
+    if (!project || !/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/.test(project) || !json || json.length > 32768) throw new Error();
+    const credential = JSON.parse(json);
+    if (credential.type !== 'service_account' || credential.project_id !== project
+      || typeof credential.client_email !== 'string' || !/^[A-Za-z0-9._-]+@[a-z0-9-]+\.iam\.gserviceaccount\.com$/.test(credential.client_email)
+      || typeof credential.private_key !== 'string' || createPrivateKey(credential.private_key).asymmetricKeyType !== 'rsa') throw new Error();
+    return { fcmEnabled: true, fcmProjectId: project, fcmCredentials: { client_email: credential.client_email, private_key: credential.private_key } };
+  } catch { throw new Error('Cấu hình FCM_PROJECT_ID/FCM_SERVICE_ACCOUNT_JSON chưa hợp lệ hoặc không cùng dự án.'); }
 }
 export function validateAppsScriptUrl(value) {
   if (typeof value !== 'string' || !/^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(value)) throw new Error('OTP_RELAY_URL phải đúng dạng https://script.google.com/macros/s/<deployment>/exec, không query, fragment, port hoặc thông tin đăng nhập.');
